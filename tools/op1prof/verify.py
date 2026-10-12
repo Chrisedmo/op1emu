@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from .marks import SHAPE, WORKLOAD, Mark
+from . import diverge
+from .census import Symbols
 from .runner import RunSpec, run
 
 
@@ -54,6 +56,16 @@ def verify(spec: RunSpec, runs: int, out: Path, expect: Optional[Path], write_ex
         tuples.append(_tuple(result.marks))
     for index, other in enumerate(tuples[1:], 1):
         report["differences"] += [f"run {index}: {line}" for line in _diff(tuples[0], other)]
+        if spec.checksum_every:
+            # Guest state, compared on its own: two runs can do the same
+            # counted work and still hold different registers.
+            first, this = out / "run00" / diverge.FILE, out / f"run{index:02d}" / diverge.FILE
+            found = diverge.first_difference(diverge.records(first), diverge.records(this))
+            if found:
+                report["differences"].append(f"run {index}: guest state differs from checksum {found['index']} "
+                                             f"({', '.join(found['fields'])})")
+                report.setdefault("divergence", {})[str(index)] = diverge.report(
+                    out / "run00", out / f"run{index:02d}", Symbols(None))
     if expect:
         saved = json.loads(expect.read_text())
         expected = saved["marks"]

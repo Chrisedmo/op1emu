@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 RECORD = struct.Struct("<IQQ")
+EDGE = struct.Struct("<IIQ")   # from block entry, to block entry, count
 
 
 def load(path: Path) -> Dict[int, Tuple[int, int]]:
@@ -28,6 +29,68 @@ def phase(prefix: Path, kind: str, begin: str, end: str) -> Dict[int, Tuple[int,
         if (a - a0) or (b - b0):
             out[key] = (a - a0, b - b0)
     return out
+
+
+def load_edges(path: Path) -> Dict[Tuple[int, int], int]:
+    data = path.read_bytes()
+    if len(data) % EDGE.size:
+        raise ValueError(f"{path}: truncated edge census ({len(data)} bytes)")
+    return {(a, b): count for a, b, count in EDGE.iter_unpack(data)}
+
+
+def edge_phase(prefix: Path, begin: str, end: str) -> Dict[Tuple[int, int], int]:
+    """Block-to-block transitions between two marks (dumps are cumulative)."""
+    first, last = (load_edges(Path(f"{prefix}.edge.{mark}")) for mark in (begin, end))
+    out = {}
+    for key, count in last.items():
+        delta = count - first.get(key, 0)
+        if delta < 0:
+            raise ValueError(f"edge counts went down for 0x{key[0]:08x}->0x{key[1]:08x}: {begin} is not before {end}")
+        if delta:
+            out[key] = delta
+    return out
+
+
+def edges_against_runs(edges: Dict[Tuple[int, int], int], runs: Dict[int, Tuple[int, int]]) -> List[str]:
+    """Each run of a block is followed by exactly one block, and both
+    censuses count a run in the phase it started in: per block, transitions
+    out of it must equal its runs."""
+    out: Dict[int, int] = {}
+    for (a, _), count in edges.items():
+        out[a] = out.get(a, 0) + count
+    return [f"0x{pc:08x}: {out.get(pc, 0)} transitions out, {r} runs"
+            for pc, (r, _) in sorted(runs.items()) if out.get(pc, 0) != r] + \
+           [f"0x{pc:08x}: {n} transitions out, no runs" for pc, n in sorted(out.items()) if pc not in runs]
+
+
+def edge_report(prefix: Path, begin: str, end: str, limit: int, symbols: Symbols) -> str:
+    """Hot transitions, and for the busiest blocks how predictable the next
+    block is: a block whose runs nearly all continue to one successor is a
+    candidate to join with it (chaining, longer blocks); a block with many
+    successors is not. Transitions include interrupt entries."""
+    edges = edge_phase(prefix, begin, end)
+    total = sum(edges.values())
+    lines = [f"edges {begin} -> {end}: {total:,} transitions between {len({a for a, _ in edges}):,} blocks"]
+    mismatch = edges_against_runs(edges, phase(prefix, "pc", begin, end))
+    if mismatch:
+        raise ValueError("edge census disagrees with the block runs it should match: " + "; ".join(mismatch[:5]))
+    lines += ["(every block run in the phase is the start of exactly one transition, checked against the "
+              "PC census)", "",
+             f"{'from':>10} {'to':>10} {'count':>12} {'share':>6}  from symbol -> to symbol"]
+    for (a, b), count in sorted(edges.items(), key=lambda kv: -kv[1])[:limit]:
+        lines.append(f"0x{a:08x} 0x{b:08x} {count:>12} {count / total * 100:5.1f}%  "
+                     f"{symbols.name(a)} -> {symbols.name(b)}")
+    out: Dict[int, Dict[int, int]] = {}
+    for (a, b), count in edges.items():
+        out.setdefault(a, {})[b] = count
+    busiest = sorted(out.items(), key=lambda kv: -sum(kv[1].values()))[:limit]
+    lines += ["", f"{'block':>10} {'runs':>12} {'succ':>5} {'top succ':>10} {'top %':>6}  symbol"]
+    for a, successors in busiest:
+        runs = sum(successors.values())
+        top, top_count = max(successors.items(), key=lambda kv: kv[1])
+        lines.append(f"0x{a:08x} {runs:>12} {len(successors):>5} 0x{top:08x} {top_count / runs * 100:5.1f}%  "
+                     f"{symbols.name(a)}")
+    return "\n".join(lines)
 
 
 class Symbols:

@@ -32,13 +32,17 @@ host makes the guest do more work, so two runs never execute the same thing.
 | `--perf-window A:B` | Write `enable` to the FIFO at mark A and `disable` at mark B |
 | `--perf-jitdump` | LLVM jitdump for `perf inject --jit` (under `$JITDUMPDIR/.debug/jit/`) |
 | `--profile-counters` | The CPU thread's user-space instructions and cycles at every mark and translation |
+| `--profile-checksum FILE` | Guest-state checksums every `--profile-checksum-every N` blocks (default 65536), from block `--profile-checksum-from` (diagnostic) |
 
 Every option is checked before the CPU starts: an unknown mark, a missing FIFO
 or a marks file for another NAND image is an error, not an empty profile.
 
 ## Phase marks
 
-A marks file names guest PC ranges in the firmware. A mark fires the first
+A marks file names guest PC ranges in the firmware. Every mark fires at a
+block entry, so the counters and censuses it closes end on a block boundary
+(the verified frame completes during device processing, and its mark fires
+at the entry of the next block). A mark fires the first
 time a block starts inside its range after starting outside it; `after` arms a
 mark only once another mark has fired (and the PC must still enter the range
 afresh). At most one mark fires per block, in file order. List marks in the
@@ -51,7 +55,7 @@ window against that order before a capture and verifies it after.
 | `bootrom`, `te-boot` | first and second entry to the L1 bootrom range |
 | `lap-begin`, `main-boot`, `lap-end` | firmware boot stages |
 | `register_cb`, `main-display` | callback registration, then the main display routine |
-| `main-frame` | the first complete panel frame after `main-display` whose RGB565 bytes have the reference SHA-256 |
+| `main-frame` | the first complete panel frame after `main-display` whose RGB565 bytes have the reference SHA-256; it fires at the next block entry, as every mark does |
 
 `main-display` is a firmware address, not proof that anything was drawn; an
 earlier, complete but different frame (a stale boot logo transfer) is rejected
@@ -127,16 +131,35 @@ makes the emulator exit nonzero. Do not use it. The header also records
 
 ## Census
 
-`--profile-census PREFIX` writes `PREFIX.pc.MARK` and `PREFIX.mmio.MARK` at
-every mark: little-endian records of `u32 key, u64, u64`, sorted by key, with
-cumulative counts.
+`--profile-census PREFIX` writes `PREFIX.pc.MARK`, `PREFIX.mmio.MARK` and
+`PREFIX.edge.MARK` at every mark, sorted little-endian records with
+cumulative counts:
 
-- `pc`: block entry PC, runs, packets executed from that entry.
-- `mmio`: MMR address, guest reads, guest writes.
+- `pc` (`u32 key, u64, u64`): block entry PC, runs, packets executed from that entry.
+- `mmio` (`u32 key, u64, u64`): MMR address, guest reads, guest writes.
+- `edge` (`u32 from, u32 to, u64 count`): block entry, the entry of the block
+  that ran next, how often. The next block is whatever the guest ran next,
+  so interrupt entries are edges too. A transition is counted in the phase
+  of the block it leaves, like that block's run, so in every phase the
+  transitions out of a block equal its runs; `census --edges` checks this
+  against the PC census and refuses dumps that disagree.
 
-Difference two marks' files for one phase. The census costs a hash-map update
+Difference two marks' files for one phase. The census costs hash-map updates
 per block and per MMR access: it changes timing, so never combine it with a
 timing measurement. The counts themselves do not depend on it.
+
+## Checksums
+
+`--profile-checksum FILE` appends one 64-byte record every N blocks: the
+blocks run so far, packets and guest cycles, the entry PC, the CEC's IPEND,
+ILAT and IMASK, and three hashes of the guest registers (data and pointer
+registers; accumulators, DAG and loop registers; system registers and ASTAT).
+Guest memory is not covered; a difference there reaches the registers soon
+after. Two deterministic runs that should do the same work produce the same
+records; `op1prof diverge` names the first one that differs. It compares
+records by position, so both runs must form the same blocks (the same
+`runs` count at each record): use it for one binary with different inputs
+or settings, or two binaries that compile the same blocks.
 
 ## perf
 
@@ -176,6 +199,8 @@ python3 -m op1prof extend op1prof-ab-* --pairs 2           # more pairs for the 
 python3 -m op1prof run    --binary $B $IN --census
 python3 -m op1prof census op1prof-run-*/run --phase main-boot:lap-end
 python3 -m op1prof compile op1prof-run-*/run --phase main-boot:main-display
+python3 -m op1prof census op1prof-run-*/run --phase main-boot:main-display --edges
+python3 -m op1prof diverge op1prof-run-A/run op1prof-run-B/run   # runs made with --checksum N
 python3 -m op1prof perf   --binary $B $IN --window main-boot:main-display
 python3 -m op1prof report op1prof-perf-*/capture --census op1prof-run-*/run --sort ns-per-run
 ```
@@ -289,7 +314,22 @@ preference and whether turbo is enabled.
 
 `census` differences the census dumps of a `run --census` between two marks:
 blocks by packets executed (with runs and packets per run), and MMRs by
-accesses. `--symbols` names PCs from `ADDRESS NAME` lines, e.g. exported from
+accesses. `census --edges` lists the hottest block-to-block transitions and,
+for the busiest blocks, how many successors each has and what share of its
+runs went to the most common one: a block that nearly always continues to
+the same successor is a candidate to join with it, one with many successors
+is not.
+
+`run` and `verify` take `--checksum N` (records every N blocks) and
+`--checksum-from RUNS`. `diverge A B` reports the first record where two runs
+differ, which fields differ, and the window of blocks the divergence lies
+in, with the options to repeat both runs at a finer interval inside it. It
+reads the files a record at a time and stops at the first difference, so a
+fine-grained rerun with millions of records is fine. `verify --checksum`
+compares guest state as a check of its own: runs whose counted work matches
+but whose registers differ are reported as differences, with where they
+begin. The research line needed a separate event-record tool for this, and
+two bugs that dropped guest work looked like 5-6% speedups until found. `--symbols` names PCs from `ADDRESS NAME` lines, e.g. exported from
 Ghidra. Counts are work, not cost.
 
 `perf` runs one boot under `perf record -k mono -g`, sampling only between
