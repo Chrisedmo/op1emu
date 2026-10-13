@@ -197,9 +197,7 @@ BlackFinCpu::BlackFinCpu(bool deterministic) : time_(deterministic), pc(0) {
     sic = std::make_shared<SIC>(0xFFC00100);
     sic->SetInterruptForwardCallback([this](int ivg, int level) {
         if (level) {
-            QueueEvent([this, ivg]() {
-                cec_raise(cpuState_.get(), ivg);
-            });
+            QueueEvent([this, ivg]() { RaiseInterrupt(ivg); });
         }
     });
     devices.push_back(sic);
@@ -207,9 +205,7 @@ BlackFinCpu::BlackFinCpu(bool deterministic) : time_(deterministic), pc(0) {
     coreTimer = std::make_shared<CoreTimer>(0xFFE03000, time_);
     coreTimer->BindInterrupt(IVG_IVTMR, [this](int ivg, int level) {
         if (level) {
-            QueueEvent([this, ivg]() {
-                cec_raise(cpuState_.get(), ivg);
-            });
+            QueueEvent([this, ivg]() { RaiseInterrupt(ivg); });
         }
     });
     devices.emplace_back(coreTimer);
@@ -470,6 +466,22 @@ u32 BlackFinCpu::PC() {
 void BlackFinCpu::QueueEvent(const std::function<void()>& event, std::chrono::nanoseconds delay) {
     std::unique_lock<std::recursive_mutex> lock(eventQueueMutex);
     eventQueue.push_back({delay, event});
+}
+
+void BlackFinCpu::RaiseInterrupt(int ivg) {
+#ifdef ENABLE_PROFILING
+    // A level the guest has not taken yet is raised again on every block
+    // while it stays asserted; only a raise that sets a new ILAT bit is
+    // something the guest can see.
+    const uint32_t ilatAddr = CEC_MMR_BASE + 4 * CEC_IDX_ILAT;
+    const uint32_t before = cec_mmr_read(cpuState_.get(), ilatAddr);
+    cec_raise(cpuState_.get(), ivg);
+    const uint32_t latched = cec_mmr_read(cpuState_.get(), ilatAddr) & ~before;
+    for (int level = 0; level < 16; ++level)
+        if (latched >> level & 1) ++irqLatched_[level];
+#else
+    cec_raise(cpuState_.get(), ivg);
+#endif
 }
 
 void BlackFinCpu::ProcessEvents() {

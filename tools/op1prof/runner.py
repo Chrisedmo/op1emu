@@ -25,6 +25,13 @@ DEFAULT_SCRIPT = "accel 100 -100 500\nvolume 128\nwait 86400000\n"
 # positional paths. Extra arguments may not use these.
 RESERVED_ARGS = ("--", "--nand-rw", "--nand-snapshot", "--headless", "--deterministic", "--input-script",
                  "--profile-marks", "--profile-until", "--profile-trace", "--profile-counters")
+# Diagnostic instrumentation: it changes timing, so a timing comparison may
+# not switch it on for one side (or for both: census, probes and perf have
+# their own commands). Host counters, which ab may use on both sides, are a
+# runner setting (`--counters`) and reserved above.
+INSTRUMENT_ARGS = ("--profile-census", "--profile-checksum", "--profile-checksum-every", "--profile-checksum-from",
+                   "--profile-probes", "--profile-dump-ir", "--profile-dump-dir", "--perf-ctl-fifo",
+                   "--perf-window", "--perf-jitdump")
 # How long an emulator that closed its output may take to exit.
 EXIT_GRACE_S = 60.0
 # A run whose output grows past this is failed and stopped: a stock boot
@@ -34,6 +41,10 @@ MAX_LOG_BYTES = 200 << 20
 
 def reserved_args(args: List[str]) -> List[str]:
     return [arg for arg in args if arg in RESERVED_ARGS]
+
+
+def instrument_args(args: List[str]) -> List[str]:
+    return [arg for arg in args if arg in INSTRUMENT_ARGS]
 
 
 def sha256_file(path: str | Path) -> str:

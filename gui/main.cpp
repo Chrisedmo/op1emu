@@ -166,7 +166,7 @@ static int RunEmulator(int argc, char* argv[]) {
                      "Profiling builds (-DENABLE_PROFILING=ON, see docs/profiling.md):\n"
                      "  --profile-marks FILE  Phase marks (firmware PC ranges, verified frame)\n"
                      "  --profile-trace FILE  Chrome/Perfetto trace of translations and marks\n"
-                     "  --profile-census PFX  Per-PC and MMIO census at every mark (diagnostic)\n"
+                     "  --profile-census PFX  Block, edge and MMIO census at every mark (diagnostic)\n"
                      "  --profile-until MARK  Stop cleanly when MARK fires\n"
                      "  --perf-ctl-fifo FIFO  perf record --control=fifo:FIFO\n"
                      "  --perf-window A:B     Enable perf at mark A, disable at mark B\n"

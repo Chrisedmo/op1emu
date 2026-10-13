@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 
 from . import compilation, machine, stats, trace
 from .marks import Mark, workload_diff
-from .runner import RunResult, RunSpec, input_hashes, run, sha256_file
+from .runner import RunResult, RunSpec, input_hashes, instrument_args, run, sha256_file
 
 # A wall-time pair is clean when neither run lost real time off-CPU:
 # wall <= 1.05 x CPU and at most 1 s of off-CPU time.
@@ -21,6 +21,7 @@ CLEAN_OFFCPU_MS = 1000.0
 DRIFT_P = 0.01
 DRIFT_MIN_RUNS = 6
 SCHEMA = "op1prof.ab.v2"
+WORKLOAD_CHANGED = "workload changed: the two sides did different guest work"
 
 
 @dataclass
@@ -100,13 +101,21 @@ def compare(base: Side, new: Side, spec: RunSpec, pairs: int, out: Path, phase: 
     report of the same batch), add them to its pairs instead of starting."""
     if pairs < 2 or pairs % 2 or (previous is None and pairs < 4):
         raise ValueError("use an even number of pairs, at least 4 (2 to extend), so AB and BA orders balance")
+    # Here rather than only in the ab command, so that a batch extended from
+    # its saved settings is held to the same rule.
+    instrumented = instrument_args(spec.args + base.args + new.args)
+    if instrumented:
+        raise ValueError(f"ab measures time and refuses diagnostic instrumentation {instrumented}: use run --census, "
+                         "run --probes, run --checksum or perf for those")
     if previous is None:
         report = {"schema": SCHEMA, "phase": list(phase), "min_effect_pct": min_effect_pct,
                   "sides": {s.name: {"binary_sha256": s.sha256, "args": s.args} for s in (base, new)},
                   "config": _config(base, new, spec, phase, min_effect_pct, allow_workload_change, seed),
                   "runs": [], "pairs": [], "extensions": 0, "status": "running"}
     else:
-        if previous.get("status") not in stats.VERDICTS + ("workload changed: the two sides did different guest work",):
+        if previous.get("schema") != SCHEMA:
+            raise ValueError(f"the batch was written as {previous.get('schema')!r}, not {SCHEMA}: start a new one")
+        if previous.get("status") not in stats.VERDICTS + (WORKLOAD_CHANGED,):
             raise ValueError(f"the batch ended {previous.get('status')!r}: only a finished batch can be extended; "
                              "start a new one")
         report = {**previous, "extensions": previous.get("extensions", 0) + 1, "status": "running"}
@@ -223,6 +232,12 @@ def summarize(report: dict, min_effect_pct: float, allow_workload_change: bool, 
     report["unstable"] = unstable
     report["changed_inputs"] = _changed_inputs(report)
 
+    # Recomputed from the runs' marks every time, so that the pairs of an
+    # extended batch are all judged by this version's gate, whichever
+    # version ran them.
+    for info, pair in zip(report["pairs"], pairs):
+        info["workload_diff"] = workload_diff(_marks(pair["base"]), _marks(pair["new"]))
+
     workload_changed = [p for p in report["pairs"] if p["workload_diff"]]
     report["workload_changed"] = bool(workload_changed)
     summary = {}
@@ -270,6 +285,6 @@ def summarize(report: dict, min_effect_pct: float, allow_workload_change: bool, 
     elif unstable:
         report["status"] = "unusable: a configuration did not repeat its own workload"
     elif workload_changed and not allow_workload_change:
-        report["status"] = "workload changed: the two sides did different guest work"
+        report["status"] = WORKLOAD_CHANGED
     else:
         report["status"] = summary[decided_on]["verdict"]

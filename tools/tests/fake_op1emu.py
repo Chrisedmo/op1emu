@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Stand-in for a profiling op1emu, for the op1prof tests.
 
-Prints [mark] lines and writes an op1.trace.v3 trace like the real emulator
-(with host instruction counts under --profile-counters).
+Prints a [mark] line for "start" and each mark of the --profile-marks file,
+in file order and the frame mark last, and writes an op1.trace.v3 trace
+like the real emulator (with host instruction counts under --profile-counters).
 Behavior comes from FAKE_* variables (the runner keeps those):
   FAKE_SCALE   multiply execution CPU by this (default 1.0)
   FAKE_WORK    packets per mark step (default 1000)
@@ -12,6 +13,7 @@ Behavior comes from FAKE_* variables (the runner keeps those):
   FAKE_IRQ     interrupts taken per mark step (default 3)
   FAKE_CODE    seed of the compiled code's hashes (default 0); FAKE_NOSHAPE drops them
   FAKE_DIVERGE checksum record from which the data registers differ
+  FAKE_SKIP    comma list of marks that never fire
   FAKE_ENVLOG  write the received environment here
 """
 import json
@@ -36,7 +38,11 @@ if "noise" in mode:
 until = opt("--profile-until")
 counted = "--profile-counters" in args
 irq = int(os.environ.get("FAKE_IRQ", "3"))
-names = ["start", "bootrom", "main-display", "main-frame"]
+with open(opt("--profile-marks")) as f:
+    config = json.load(f)
+names = ["start"] + [m["name"] for m in config["marks"]] + ([config["frame"]["name"]] if "frame" in config else [])
+skip = set(filter(None, os.environ.get("FAKE_SKIP", "").split(",")))
+names = [name for name in names if name not in skip]
 events, wall, cpu, insns = [], 0, 0, 0
 t0 = 10_000_000_000  # ns, an arbitrary monotonic origin
 for step, name in enumerate(names):
@@ -57,7 +63,8 @@ for step, name in enumerate(names):
         cpu += execution
         insns += 5_000_000 + 3 * execution
     counters = {"runs": step * work // 3, "packets": step * work, "cycles": step * work,
-                "translated": step, "mmio_r": step * 7, "mmio_w": step * 5, "events": step * 2, "irq": step * irq}
+                "translated": step, "mmio_r": step * 7, "mmio_w": step * 5, "events": step * 2, "irq": step * irq,
+                "irq_latched": step * irq}
     host = {"host_insns": insns, "host_cycles": 2 * insns} if counted else {}
     events.append({"name": name, "cat": "mark", "ph": "i", "s": "g", "pid": 1, "tid": 1,
                    "ts": (t0 + wall) / 1e3, "args": {"pc": step, "wall_ns": wall, "thread_cpu_ns": cpu,

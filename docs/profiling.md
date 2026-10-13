@@ -2,8 +2,9 @@
 
 Measurement support for the emulator itself: where a boot spends its time,
 how much guest work it did, and whether a change made it faster. It is built
-only on request and is meant to be driven by the `tools/op1prof` runner (added
-separately); this page describes what the emulator records.
+only on request and is meant to be driven by the `tools/op1prof` runner
+(see [Measuring with op1prof](#measuring-with-op1prof)); the first part of
+this page describes what the emulator records.
 
 ## Build
 
@@ -26,7 +27,7 @@ host makes the guest do more work, so two runs never execute the same thing.
 |---|---|
 | `--profile-marks FILE` | Phase marks: one `[mark]` line per mark on stdout |
 | `--profile-trace FILE` | Chrome/Perfetto JSON trace of translations and marks |
-| `--profile-census PREFIX` | Per-PC and MMIO counts at every mark (diagnostic) |
+| `--profile-census PREFIX` | Per-block, block-to-block and MMIO counts at every mark (diagnostic) |
 | `--profile-until MARK` | Stop cleanly when MARK fires |
 | `--perf-ctl-fifo FIFO` | Control FIFO of `perf record --control=fifo:FIFO` |
 | `--perf-window A:B` | Write `enable` to the FIFO at mark A and `disable` at mark B |
@@ -47,7 +48,9 @@ block entry, so the counters and censuses it closes end on a block boundary
 at the entry of the next block). A mark fires the first
 time a block starts inside its range after starting outside it; `after` arms a
 mark only once another mark has fired (and the PC must still enter the range
-afresh). At most one mark fires per block, in file order. List marks in the
+afresh). At most one of the file's marks fires per block, in file order; the
+frame mark, which waits for the next block after the frame completes, can
+fire on the same block just before one of them. List marks in the
 order they fire (the frame mark counts as last): `op1prof perf` checks its
 window against that order before a capture and verifies it after.
 `profiling/marks/op1-stock-nand.json` covers the stock image:
@@ -70,7 +73,7 @@ Each mark prints cumulative counters since the `start` mark (the CPU thread's
 first block), so any two marks can be differenced:
 
 ```
-[mark] main-display pc=0x019ab8b6 wall_ms=... cpu_ms=... process_cpu_ms=... runs=... packets=... cycles=... translated=... mmio_r=... mmio_w=... events=... irq=... [host_insns=... host_cycles=...] deterministic=1
+[mark] main-display pc=0x019ab8b6 wall_ms=... cpu_ms=... process_cpu_ms=... runs=... packets=... cycles=... translated=... mmio_r=... mmio_w=... events=... irq=... irq_latched=... [host_insns=... host_cycles=...] deterministic=1
 ```
 
 - `wall_ms` is monotonic time, `cpu_ms` the CPU thread's own CPU time. The
@@ -81,10 +84,19 @@ first block), so any two marks can be differenced:
 - `runs` is blocks executed, `packets` instruction packets (bcore's
   `CpuState::packets`), `cycles` guest cycles (equal to packets in
   deterministic mode), `translated` blocks compiled.
-- `mmio_r`/`mmio_w` count guest accesses at or above 0xFFC00000; `events`
-  counts delivered CPU-queue events (device callbacks, interrupts); `irq`
+- `mmio_r`/`mmio_w` count guest accesses at or above 0xFFC00000; `irq`
   counts interrupts and exceptions the guest took (bcore's
   `BcoreStats::interrupts_entered`; the trace has them per IVG level).
+  `irq_latched` counts the interrupts the host raised that set a new bit in
+  the CEC's ILAT; the trace has them per level too.
+- `events` counts delivered CPU-queue events (device callbacks, interrupt
+  raises). It is how the host does the work, not what the guest sees: a
+  device interrupt level that stays asserted is raised again after every
+  block until the guest takes it, and those repeats leave ILAT as it was.
+  It is reported as shape, beside `runs` and `translated`, which an
+  optimization may change. A stock boot to `main-display` delivers 626,738
+  events, takes 68,688 interrupts and exceptions, and latches 62,454 new
+  ILAT bits from host raises.
 - `host_insns`/`host_cycles` (only with `--profile-counters`) are the CPU
   thread's user-space instructions and cycles, read from the CPU's
   performance counters. They need `kernel.perf_event_paranoid` at most 2 and,
@@ -93,7 +105,8 @@ first block), so any two marks can be differenced:
   only part of the time (as on an efficiency core).
 
 With `--deterministic` and the same inputs, every counter except the times
-and host counters is identical from run to run. A change that alters them changed what
+and host counters is identical from run to run. A change that alters
+`packets`, `cycles`, `mmio_r`, `mmio_w`, `irq` or `irq_latched` changed what
 the guest did, not just how fast the host did it.
 
 ## Trace
@@ -107,8 +120,9 @@ microseconds, the clock `perf record -k mono` uses.
   `ir-optimize` and `materialize` spans come from bcore. Only the union of
   `translate` spans is compile time: never add the nested stages to it.
 - Marks (category `mark`) are instant events carrying the same counters as the
-  `[mark]` line, with `args.thread_cpu_ns`, `args.process_cpu_ns` and
-  `args.irq_levels` (entries per IVG level, 0 = EMU ... 15 = IVG15).
+  `[mark]` line, with `args.thread_cpu_ns`, `args.process_cpu_ns`,
+  `args.irq_levels` (entries per IVG level, 0 = EMU ... 15 = IVG15) and
+  `args.irq_latched_levels` (new ILAT bits per level).
 - With `--profile-counters` the header says `"counters": true` and every
   `translate` span also has `args.insns`, the instructions retired inside it.
 - Every successful `translate` span describes the code it produced (bcore's
@@ -128,7 +142,8 @@ grow when the thread is descheduled. Execution instructions are split the same
 way: the marks' `host_insns` difference minus the spans' `insns`.
 
 The recorder holds 262144 events; a trace that overflows reports `dropped` and
-makes the emulator exit nonzero. Do not use it. The header also records
+makes the emulator exit nonzero. Do not use it. A trace recorded without
+`--deterministic` is refused by every op1prof command that reads one. The header also records
 `cpu_thread_tid`, the CPU thread's id, to select its perf samples.
 
 ## Census
@@ -189,7 +204,7 @@ and declares the three VDK context-switch paths. At each, the L1 word
 
 ```sh
 python3 -m op1prof run --binary $B $IN --probes --until main-display
-python3 -m op1prof probes op1prof-run-*/run          # what each probe captured
+python3 -m op1prof probes op1prof-run-*/run          # what each probe captured (--top values per field)
 python3 -m op1prof threads op1prof-run-*/run --probe vdk-switch --probe vdk-switch-irq \
   --probe vdk-start --thread current --name 14914=main --name 1324=fir-fill --perfetto threads.json
 ```
@@ -214,7 +229,8 @@ to those blocks' compile CPU in the trace. `run --dump-pc PC` and
 `perf --dump-pc PC` (repeatable) put the files in the run's `ir/`.
 
 `annotate CAPTURE --pc PC` shows `perf annotate` of that block's generated
-code from a perf capture, beside the IR files of the same run. It refuses a
+code from a perf capture (the first `--lines` lines, default 120), beside the
+IR files of the same run. It refuses a
 non-precise event, which cannot rank instructions, unless
 `--allow-imprecise`:
 
@@ -285,8 +301,12 @@ Every run uses `--deterministic`, fixed sensors, `--nand-snapshot`, its own
 directory with a copy of the OTP image, and an environment without any `OP1_*`
 variable. Extra emulator arguments (`--arg`, `--base-arg`, `--new-arg`) can
 vary anything else but are refused if they repeat one of these options or the
-marks, trace and `--profile-until` settings, since the emulator keeps the last
-value. The binary is copied aside first (by content hash), so a rebuild in
+marks, trace, counters and `--profile-until` settings, since the emulator
+keeps the last value. `ab` also refuses the diagnostic options (census,
+probes, checksums, IR dumps, perf control) on either side: they change
+timing, and an `ab` measures timing. `--phase` and `--until` are checked
+against the marks file before anything runs; `verify` compares every mark
+and takes no `--phase`. The binary is copied aside first (by content hash), so a rebuild in
 the middle of a batch cannot change what is measured. Runs end at
 `--until` (default `main-frame`). A run that exits nonzero, never reaches
 that mark, goes `--progress-timeout` seconds without a new mark, or closes its
@@ -307,9 +327,10 @@ port and spins) or when MemAvailable is below `--min-mem-gb` (default 10).
 ### `ab`
 
 Pairs alternate AB and BA. Each pair is gated on the guest workload: both
-sides must fire the same marks with the same packets, cycles, MMIO accesses
-and delivered events (`runs` and `translated` may differ, since an
-optimization that forms longer blocks changes them legitimately). Each side
+sides must fire the same marks with the same packets, cycles, MMIO accesses,
+interrupts taken and ILAT bits latched (`runs`, `translated` and `events` may
+differ: an optimization that forms longer blocks, or raises an asserted
+interrupt fewer times, changes them legitimately). Each side
 must also reproduce its own workload across pairs. The verdict is reached on
 **execution CPU** (thread CPU between the phase marks minus translation CPU),
 with a 95% interval over whole pairs and a practical threshold `--min-effect`
@@ -319,8 +340,12 @@ so alone it is too narrow. Each metric also reports how many pairs the new
 side won and the exact sign-test p value (four of four is p = 0.125, not
 evidence by itself). Compile CPU is reported beside it. Wall-clock
 execution is reported only over clean pairs (both runs: wall at most 1.05x
-CPU and at most 1 s off-CPU). The workload gate includes `irq` when both
-sides report it.
+CPU and at most 1 s off-CPU). The gate compares `irq` and `irq_latched`
+only when both sides report them, so a binary older than either can still be
+compared on the rest. `extend` and `verify --expect` refuse files of another
+schema. `extend` holds a batch's saved arguments to the same instrumentation
+rule as `ab`, and the summary re-judges every pair's workload from its runs'
+marks, so the pairs an older op1prof ran are gated like the new ones.
 
 With `--counters` (also on `run` and `verify`) every run counts host
 instructions, and `ab` reports **execution instructions** with their own
@@ -409,8 +434,10 @@ fine-grained rerun with millions of records is fine. `verify --checksum`
 compares guest state as a check of its own: runs whose counted work matches
 but whose registers differ are reported as differences, with where they
 begin. The research line needed a separate event-record tool for this, and
-two bugs that dropped guest work looked like 5-6% speedups until found. `--symbols` names PCs from `ADDRESS NAME` lines, e.g. exported from
-Ghidra. Counts are work, not cost.
+two bugs that dropped guest work looked like 5-6% speedups until found.
+
+`--symbols` (on `census`, `compile`, `diverge` and `report`) names PCs from
+`ADDRESS NAME` lines, e.g. exported from Ghidra. Counts are work, not cost.
 
 `perf` runs one boot under `perf record -k mono -g`, sampling only between
 the two `--window` marks (an inverted window, or an `--until` before the
@@ -448,7 +475,9 @@ not need them and reached 99.8%; they need a hardware event:
 ```sh
 python3 -m op1prof perf --binary $B $IN --window main-boot:main-display \
   --event cycles:u --period 4000000 --call-graph lbr
-``` For `cpu-clock` it also compares the sampled CPU
+```
+
+For `cpu-clock` it also compares the sampled CPU
 time with the trace's execution CPU. For a non-precise event it says that the
 totals are only valid per block and symbol.
 
@@ -460,7 +489,10 @@ event queue, CPU loop). The census run must have done exactly the capture's
 guest work, or the join is refused. `--sort ns-per-run` ranks blocks by how
 expensive one execution is rather than by total share. These are sampled
 estimates: their error comes from repeating captures, not from sample counts.
-`--json FILE` writes the whole report for further analysis.
+`--json FILE` writes the whole report for further analysis, and
+`--categories FILE` replaces `profiling/categories.json`. A trace that does
+not name the CPU thread (`cpu_thread_tid`, from binaries before it) is
+refused: every thread's samples would count as the CPU thread's.
 
 `compile RUNDIR [--phase A:B]` reports what a run compiled: translations
 and blocks, compile CPU with its median, 95th percentile and maximum per

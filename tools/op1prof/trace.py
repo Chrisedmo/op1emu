@@ -75,6 +75,10 @@ def load(path: str) -> dict:
     if trace.get("dropped"):
         # A trace with a missing tail misstates compile time; never use it.
         raise TraceError(f"{path}: {trace['dropped']} events dropped")
+    if trace.get("deterministic") is False:
+        # Host time: the guest did whatever the host's speed let it do, so
+        # nothing in this trace repeats or compares.
+        raise TraceError(f"{path}: recorded without --deterministic")
     return trace
 
 

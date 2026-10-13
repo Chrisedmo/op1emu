@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from . import marks
 from .runner import RunResult, RunSpec, run
 
 PRECISE = re.compile(r":[a-z]*p")
@@ -21,30 +22,13 @@ def is_precise(event: str) -> bool:
     return bool(PRECISE.search(event))
 
 
-def mark_order(marks_file: Path) -> List[str]:
-    """Marks in the order a marks file lists them, the frame mark last. The
-    profiler does not impose it (any armed range can fire first), so it is a
-    contract on the file that check_fired() verifies after each capture."""
-    config = json.loads(marks_file.read_text())
-    order = ["start"] + [m["name"] for m in config["marks"]]
-    if "frame" in config:
-        order.append(config["frame"]["name"])
-    return order
+# Kept here for perf's callers; the checks live with the marks.
+mark_order = marks.mark_order
 
 
 def check_window(marks_file: Path, window: Tuple[str, str], until: str) -> Optional[str]:
-    order = mark_order(marks_file)
-    begin, end = window
-    for name in (begin, end, until):
-        if name not in order:
-            return f"unknown mark {name!r}"
-    # An inverted window records nothing and looks merely empty, not wrong.
-    if order.index(begin) >= order.index(end):
-        return f"window {begin}:{end} is empty: {begin} does not come before {end}"
-    # Stopping first would leave the window open and the end mark missing.
-    if order.index(until) < order.index(end):
-        return f"--until {until} comes before the window end {end}"
-    return None
+    problem = marks.check_phase(marks_file, window, until)
+    return problem.replace("phase", "window") if problem else None
 
 
 def check_fired(marks_file: Path, window: Tuple[str, str], fired: List[str]) -> Optional[str]:

@@ -89,6 +89,7 @@ struct Profiler::Impl : BcoreEventSink {
         uint64_t wall_ns = 0, cpu_ns = 0, process_cpu_ns = 0, runs = 0, packets = 0, cycles = 0;
         uint64_t translated = 0, mmio_r = 0, mmio_w = 0, events = 0;
         uint64_t irq = 0, irqLevels[16] = {};
+        uint64_t irqLatched = 0, irqLatchedLevels[16] = {};
         uint64_t hostInsns = 0, hostCycles = 0;  // with --profile-counters
     };
     struct Event {
@@ -425,6 +426,8 @@ struct Profiler::Impl : BcoreEventSink {
         for (int level = 0; level < 16; ++level) {
             c.irqLevels[level] = stats.interrupts_entered[level];
             c.irq += stats.interrupts_entered[level];
+            c.irqLatchedLevels[level] = cpu.IrqLatched()[level];
+            c.irqLatched += cpu.IrqLatched()[level];
         }
         HwCounters::Values now;
         if (ReadCounters(now)) {
@@ -468,9 +471,9 @@ struct Profiler::Impl : BcoreEventSink {
         // Cumulative from "start": difference any two marks. tools/op1prof parses this.
         std::printf("[mark] %s pc=0x%08x wall_ms=%.3f cpu_ms=%.3f process_cpu_ms=%.3f runs=%" PRIu64
                     " packets=%" PRIu64 " cycles=%" PRIu64 " translated=%" PRIu64 " mmio_r=%" PRIu64
-                    " mmio_w=%" PRIu64 " events=%" PRIu64 " irq=%" PRIu64,
+                    " mmio_w=%" PRIu64 " events=%" PRIu64 " irq=%" PRIu64 " irq_latched=%" PRIu64,
                     name, pc, c.wall_ns / 1e6, c.cpu_ns / 1e6, c.process_cpu_ns / 1e6, c.runs, c.packets, c.cycles,
-                    c.translated, c.mmio_r, c.mmio_w, c.events, c.irq);
+                    c.translated, c.mmio_r, c.mmio_w, c.events, c.irq, c.irqLatched);
         if (hw.IsOpen() && !countersFailed)
             std::printf(" host_insns=%" PRIu64 " host_cycles=%" PRIu64, c.hostInsns, c.hostCycles);
         std::printf(" deterministic=%d\n", cpu.Time().Deterministic() ? 1 : 0);
@@ -704,6 +707,10 @@ struct Profiler::Impl : BcoreEventSink {
                              c.mmio_w, c.events, c.process_cpu_ns, c.irq);
                 for (int level = 0; level < 16; ++level)
                     std::fprintf(file, "%s%" PRIu64, level ? "," : "", c.irqLevels[level]);
+                std::fputs("]", file);
+                std::fprintf(file, ",\"irq_latched\":%" PRIu64 ",\"irq_latched_levels\":[", c.irqLatched);
+                for (int level = 0; level < 16; ++level)
+                    std::fprintf(file, "%s%" PRIu64, level ? "," : "", c.irqLatchedLevels[level]);
                 std::fputs("]", file);
                 if (counted)
                     std::fprintf(file, ",\"host_insns\":%" PRIu64 ",\"host_cycles\":%" PRIu64, c.hostInsns,

@@ -10,6 +10,8 @@ from . import diverge
 from .census import Symbols
 from .runner import RunSpec, run
 
+EXPECT_SCHEMA = "op1prof.expect.v1"
+
 
 def _tuple(marks: List[Mark]) -> List[dict]:
     return [{"name": m.name, **{k: m.counters[k] for k in WORKLOAD + SHAPE if k in m.counters}} for m in marks]
@@ -68,6 +70,8 @@ def verify(spec: RunSpec, runs: int, out: Path, expect: Optional[Path], write_ex
                     out / "run00", out / f"run{index:02d}", Symbols(None))
     if expect:
         saved = json.loads(expect.read_text())
+        if saved.get("schema") != EXPECT_SCHEMA:
+            raise ValueError(f"{expect}: not an op1prof expect file ({EXPECT_SCHEMA})")
         expected = saved["marks"]
         # Older expect files carry no inputs; when they do, a different
         # image explains a different workload before any counter does.
@@ -77,7 +81,7 @@ def verify(spec: RunSpec, runs: int, out: Path, expect: Optional[Path], write_ex
                 report["differences"].append(f"expected: input {key}: {value} vs {inputs.get(key)}")
         report["differences"] += [f"expected: {line}" for line in _diff(expected, tuples[0])]
     if write_expect and not report["differences"]:
-        write_expect.write_text(json.dumps({"schema": "op1prof.expect.v1", "inputs": report["runs"][0]["inputs"],
+        write_expect.write_text(json.dumps({"schema": EXPECT_SCHEMA, "inputs": report["runs"][0]["inputs"],
                                              "marks": tuples[0]}, indent=1) + "\n")
     report["status"] = "deterministic" if not report["differences"] else "differences found"
     path.write_text(json.dumps(report, indent=1))

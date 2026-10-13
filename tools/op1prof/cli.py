@@ -11,7 +11,8 @@ from pathlib import Path
 from . import ab, census, compilation, diverge, machine, perf, probes, stats, trace, verify
 from . import report as perf_report
 from .categories import Categories
-from .runner import REPO, RunSpec, reserved_args, run, sha256_file, snapshot_binary
+from . import marks as marks_file
+from .runner import REPO, RunSpec, instrument_args, reserved_args, run, sha256_file, snapshot_binary
 
 # Other threads' CPU (frontend, USB/IP loop) worth a warning, relative to execution CPU.
 OTHER_THREADS_WARN = 0.05
@@ -90,6 +91,16 @@ def _check_args(extra) -> None:
         raise SystemExit(f"extra emulator arguments may not set what every run fixes: {reserved}")
 
 
+def _check_timing_args(extra) -> None:
+    """ab compares time: diagnostic instrumentation, on either side, would be
+    part of what it measures."""
+    _check_args(extra)
+    instrumented = instrument_args(list(extra))
+    if instrumented:
+        raise SystemExit(f"ab measures time and refuses diagnostic instrumentation {instrumented}: use run --census, "
+                         "run --probes, run --checksum or perf for those")
+
+
 def _spec(args, binary: Path) -> RunSpec:
     for path in (args.nand, args.otp, args.marks):
         if not path.is_file():
@@ -104,16 +115,21 @@ def _spec(args, binary: Path) -> RunSpec:
 
 
 def _phase(args) -> tuple:
-    if args.phase:
-        begin, _, end = args.phase.partition(":")
-        if not end:
-            raise SystemExit("--phase must be BEGIN:END")
-        return begin, end
-    return "start", args.until
+    """The phase of the time metrics, checked against the marks file before
+    any run: a bad name found afterwards would cost the whole run."""
+    try:
+        phase = marks_file.parse_phase(args.phase) if args.phase else ("start", args.until)
+        problem = marks_file.check_phase(args.marks, phase, args.until)
+    except (OSError, ValueError, KeyError) as error:
+        raise SystemExit(f"--phase/--until: {error}")
+    if problem:
+        raise SystemExit(f"--phase/--until: {problem}")
+    return phase
 
 
 def cmd_run(args) -> int:
     _check_args(args.arg)
+    phase = _phase(args)
     if not _preflight(args):
         return 2
     out = _out(args, "run")
@@ -124,8 +140,7 @@ def cmd_run(args) -> int:
               "status": "reached" if result.reached else f"failed: {result.error}"}
     if result.reached:
         trace_data = trace.load(str(result.trace_path))
-        report["phase"] = {"begin": _phase(args)[0], "end": _phase(args)[1],
-                           **trace.phase(trace_data, *_phase(args)).to_json()}
+        report["phase"] = {"begin": phase[0], "end": phase[1], **trace.phase(trace_data, *phase).to_json()}
         report["phases"] = [{"begin": a, "end": b, **p.to_json()} for a, b, p in trace.phases(trace_data)]
     (out / "results.json").write_text(json.dumps(report, indent=1))
     for mark in result.marks:
@@ -155,8 +170,19 @@ def cmd_run(args) -> int:
 
 def cmd_verify(args) -> int:
     _check_args(args.arg)
+    if args.phase:
+        raise SystemExit("verify compares every mark of every run; --phase does not apply")
+    _phase(args)  # --until must name a mark
     if not _preflight(args, compares=True):
         return 2
+    if args.expect:
+        # Before any run, so a wrong file costs nothing.
+        try:
+            saved = json.loads(args.expect.read_text())
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"--expect: {error}")
+        if not isinstance(saved, dict) or saved.get("schema") != verify.EXPECT_SCHEMA:
+            raise SystemExit(f"--expect: {args.expect} is not an op1prof expect file ({verify.EXPECT_SCHEMA})")
     out = _out(args, "verify")
     report = verify.verify(_spec(args, snapshot_binary(args.binary, out)), args.runs, out,
                            args.expect, args.write_expect)
@@ -171,7 +197,8 @@ def cmd_verify(args) -> int:
 
 
 def cmd_ab(args) -> int:
-    _check_args(args.arg + args.base_arg + args.new_arg)
+    _check_timing_args(args.arg + args.base_arg + args.new_arg)
+    phase = _phase(args)
     if not _preflight(args, compares=True):
         return 2
     out = _out(args, "ab")
@@ -185,7 +212,7 @@ def cmd_ab(args) -> int:
     new = ab.Side("new", snapshot_binary(new_binary, out), list(args.new_arg if not args.aa else args.base_arg),
                   sha256_file(new_binary))
     try:
-        report = ab.compare(base, new, _spec(args, base.binary), args.pairs, out, _phase(args),
+        report = ab.compare(base, new, _spec(args, base.binary), args.pairs, out, phase,
                             args.min_effect, args.allow_workload_change)
     except ValueError as error:
         raise SystemExit(str(error))
@@ -377,6 +404,9 @@ def cmd_census(args) -> int:
         elif args.mmio_first:
             from .marks import parse_marks
             fired = {m.name: m for m in parse_marks((args.run / "log.txt").read_text(errors="replace").splitlines())}
+            missing = [name for name in (begin, end) if name not in fired]
+            if missing:
+                raise ValueError(f"marks did not fire in this run: {missing} (fired: {list(fired)})")
             window = (fired[begin].counters["cycles"], fired[end].counters["cycles"])
             print(census.mmio_first_report(args.run / "census", begin, end, window, args.top, symbols))
         else:

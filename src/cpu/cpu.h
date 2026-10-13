@@ -2,6 +2,7 @@
 
 #include "emu.h"
 #include "time_source.h"
+#include <array>
 #include <atomic>
 #include <memory>
 #include <vector>
@@ -86,6 +87,8 @@ public:
     void SetCoreEventSink(BcoreEventSink* sink);
     void SetPerfJitdump(bool enable);
     uint64_t EventsDelivered() const { return eventsDelivered_; }
+    // Host-raised interrupts that set a new ILAT bit, per IVG level.
+    const std::array<uint64_t, 16>& IrqLatched() const { return irqLatched_; }
     const CpuState& State() const { return *cpuState_; }
 #endif
     // Deterministic mode only: RTC calendar time at guest time zero.
@@ -95,6 +98,7 @@ protected:
     void ProcessInterrupt(int pin, int level);
     void ServicePanel();
     void ProcessEvents();
+    void RaiseInterrupt(int ivg);
 
     // Declared before the devices, which keep a reference to it.
     TimeSource time_;
@@ -121,6 +125,7 @@ protected:
 #ifdef ENABLE_PROFILING
     Profiler* profiler_ = nullptr;
     uint64_t eventsDelivered_ = 0;
+    std::array<uint64_t, 16> irqLatched_{};
 #endif
     // Last cyclesElapsed value the GP timers were advanced to (see Run()).
     uint64_t lastTimerCycles_ = 0;

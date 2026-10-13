@@ -17,13 +17,17 @@ from op1prof.marks import parse_mark, workload_diff, parse_marks  # noqa: E402
 from op1prof.runner import RESERVED_ARGS, RunSpec, run, snapshot_binary, sha256_file  # noqa: E402
 
 FAKE = Path(__file__).with_name("fake_op1emu.py")
+# The marks the fake emulator fires, in this order after "start".
+FAKE_MARKS = {"nand_sha256": "0" * 64, "marks": [{"name": "bootrom"}, {"name": "main-display"}],
+              "frame": {"name": "main-frame"}}
 
 
 @pytest.fixture
 def files(tmp_path):
     os.chmod(FAKE, os.stat(FAKE).st_mode | stat.S_IXUSR)
-    for name in ("nand.bin", "otp.bin", "marks.json"):
+    for name in ("nand.bin", "otp.bin"):
         (tmp_path / name).write_text("x")
+    (tmp_path / "marks.json").write_text(json.dumps(FAKE_MARKS))
     return tmp_path
 
 
@@ -40,7 +44,7 @@ def test_parse_mark_line():
     m = parse_mark("[mark] main-display pc=0x019ab8b6 wall_ms=1.5 cpu_ms=1.25 runs=3 packets=10 "
                    "cycles=10 translated=2 mmio_r=1 mmio_w=0 events=4 deterministic=1")
     assert m.name == "main-display" and m.pc == 0x019ab8b6 and m.deterministic
-    assert m.workload() == {"packets": 10, "cycles": 10, "mmio_r": 1, "mmio_w": 0, "events": 4}
+    assert m.workload() == {"packets": 10, "cycles": 10, "mmio_r": 1, "mmio_w": 0}  # events is shape
     assert parse_mark("unrelated line") is None
 
 
@@ -318,8 +322,9 @@ def test_fired_marks_must_follow_file_order(tmp_path):
 
 
 def test_perf_fails_when_the_window_never_closed(files, monkeypatch, capsys):
-    # The fake never fires lap-end: the run reaches --until, but the window
-    # it was meant to sample did not close, so there is nothing to report.
+    # lap-end never fires: the run reaches --until, but the window it was
+    # meant to sample did not close, so there is nothing to report.
+    monkeypatch.setenv("FAKE_SKIP", "lap-end")
     marks = files / "window.json"
     marks.write_text(json.dumps({"marks": [{"name": "bootrom"}, {"name": "lap-end"}, {"name": "main-display"}],
                                  "frame": {"name": "main-frame"}}))
@@ -1071,3 +1076,112 @@ def test_run_dumps_ir_of_chosen_blocks_and_annotate_needs_a_precise_event(files,
     text = perf.annotate(capture, 0x1a5e27e, True, 3)
     assert calls[0][-2:] == ["-s", "bb_0x01a5e27e"]
     assert "shares are where the timer landed" in text and "... 2 more lines" in text
+
+
+# ---- gate and run hygiene ----
+
+def test_events_are_shape_and_latched_interrupts_are_work():
+    line = ("[mark] a pc=0x0 wall_ms=0 cpu_ms=0 runs=1 packets=10 cycles=10 translated=1 mmio_r=0 mmio_w=0 "
+            "events={events} irq=5{latched}")
+    base = parse_mark(line.format(events=40, latched=" irq_latched=5"))
+    # Fewer repeated raises of an asserted level change nothing the guest sees.
+    assert workload_diff([base], [parse_mark(line.format(events=12, latched=" irq_latched=5"))]) == []
+    assert workload_diff([base], [parse_mark(line.format(events=40, latched=" irq_latched=4"))])
+    # A binary older than irq_latched is compared on the rest.
+    assert workload_diff([base], [parse_mark(line.format(events=40, latched=""))]) == []
+
+
+@pytest.mark.parametrize("flag", ["--profile-census", "--profile-probes", "--profile-checksum", "--perf-jitdump",
+                                  "--profile-dump-ir"])
+@pytest.mark.parametrize("where", ["--arg", "--base-arg", "--new-arg"])
+def test_ab_refuses_diagnostic_instrumentation(files, tmp_path, flag, where):
+    with pytest.raises(SystemExit, match="refuses diagnostic instrumentation"):
+        cli.main(["ab", "--base-bin", str(FAKE), "--nand", str(files / "nand.bin"), "--otp", str(files / "otp.bin"),
+                  "--marks", str(files / "marks.json"), "--force", "--out", str(tmp_path / "a"),
+                  f"{where}={flag}", "--new-arg=--rtc-epoch"])
+    assert not (tmp_path / "a").exists()
+
+
+@pytest.mark.parametrize("command,extra", [
+    ("run", ["--phase", "bootrom:nowhere"]),
+    ("run", ["--phase", "main-display:bootrom"]),
+    ("run", ["--phase", "bootrom"]),
+    ("run", ["--until", "nowhere"]),
+    ("run", ["--until", "bootrom", "--phase", "start:main-display"]),
+    ("verify", ["--phase", "start:bootrom"]),
+    ("verify", ["--until", "nowhere"]),
+])
+def test_phase_and_until_are_checked_before_any_run(files, tmp_path, command, extra):
+    with pytest.raises(SystemExit):
+        _cli(files, command, "--out", str(tmp_path / "r"), *extra)
+    assert not (tmp_path / "r").exists()
+
+
+def test_ab_checks_its_phase_before_any_run(files, tmp_path):
+    with pytest.raises(SystemExit, match="unknown mark"):
+        cli.main(["ab", "--base-bin", str(FAKE), "--nand", str(files / "nand.bin"), "--otp", str(files / "otp.bin"),
+                  "--marks", str(files / "marks.json"), "--force", "--out", str(tmp_path / "a"), "--aa",
+                  "--phase", "start:lap-end"])
+    assert not (tmp_path / "a").exists()
+
+
+def test_files_read_back_must_have_their_schema(files, tmp_path):
+    expect = tmp_path / "expect.json"
+    expect.write_text(json.dumps({"marks": []}))
+    with pytest.raises(SystemExit, match="not an op1prof expect file"):
+        _cli(files, "verify", "--out", str(tmp_path / "v"), "--expect", str(expect))
+    assert not (tmp_path / "v").exists()
+    batch = tmp_path / "batch"
+    batch.mkdir()
+    (batch / "results.json").write_text(json.dumps({"schema": "op1prof.ab.v1", "status": "inconclusive",
+                                                    "config": {}}))
+    with pytest.raises(SystemExit):
+        cli.main(["extend", str(batch), "--pairs", "2", "--force"])
+
+
+def test_a_trace_without_deterministic_time_is_refused(tmp_path):
+    path = tmp_path / "t.json"
+    path.write_text(json.dumps({**_trace([]), "deterministic": False}))
+    with pytest.raises(trace.TraceError, match="without --deterministic"):
+        trace.load(str(path))
+    path.write_text(json.dumps({**_trace([]), "deterministic": True}))
+    assert trace.load(str(path))
+
+
+def test_mmio_first_names_marks_that_did_not_fire(files, tmp_path, capsys):
+    assert _cli(files, "run", "--out", str(tmp_path / "r"), "--until", "main-display") == 0
+    assert cli.main(["census", str(tmp_path / "r" / "run"), "--phase", "bootrom:main-frame", "--mmio-first"]) == 2
+    assert "did not fire" in capsys.readouterr().err
+
+
+def _batch(files, out):
+    """A finished A/A batch of four pairs in `out`, and its saved report."""
+    out.mkdir()
+    ab.compare(_side("base", files, out), _side("new", files, out), spec(files), 4, out,
+               ("start", "main-frame"), 2.0, False)
+    return json.loads((out / "results.json").read_text())
+
+
+def test_extend_holds_saved_settings_to_the_instrumentation_rule(files, tmp_path):
+    # A batch an older op1prof started with one side's probes on.
+    out = tmp_path / "ab"
+    saved = _batch(files, out)
+    saved["config"]["sides"]["new"]["args"] = ["--profile-probes"]
+    (out / "results.json").write_text(json.dumps(saved))
+    with pytest.raises(SystemExit, match="refuses diagnostic instrumentation"):
+        cli.main(["extend", str(out), "--pairs", "2", "--force"])
+    assert len(json.loads((out / "results.json").read_text())["pairs"]) == 4   # nothing ran
+
+
+def test_extend_judges_earlier_pairs_by_the_current_gate(files, tmp_path):
+    # An older op1prof gated on events and recorded these differences.
+    out = tmp_path / "ab"
+    saved = _batch(files, out)
+    for pair in saved["pairs"]:
+        pair["workload_diff"] = ["main-display.events: 6 vs 4 (-33.333%)"]
+    saved["status"] = ab.WORKLOAD_CHANGED
+    (out / "results.json").write_text(json.dumps(saved))
+    cli.main(["extend", str(out), "--pairs", "2", "--force"])
+    report = json.loads((out / "results.json").read_text())
+    assert [p["workload_diff"] for p in report["pairs"]] == [[]] * 6
+    assert report["status"] != ab.WORKLOAD_CHANGED and not report["workload_changed"]

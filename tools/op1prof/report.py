@@ -145,9 +145,12 @@ def attribute(samples: Iterable[Sample], trace_data: dict, window: Tuple[str, st
                     for e in trace_data["traceEvents"] if e.get("name") == "translate")
     starts = [s for s, _ in spans]
     tid = trace_data.get("cpu_thread_tid")
+    if tid is None:
+        # Every thread's samples would count as the CPU thread's.
+        raise ValueError("the trace does not name the CPU thread (cpu_thread_tid): record it with a newer binary")
     out = Attribution()
     for sample in samples:
-        if tid is not None and sample.tid != tid:
+        if sample.tid != tid:
             fate = "other_threads"
         elif not lo <= sample.time_ns < hi:
             fate = "outside_window"

@@ -6,20 +6,26 @@ The emulator prints one line per mark, cumulative since the `start` mark:
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
 MARK_RE = re.compile(r"^\[mark\] (?P<name>[A-Za-z0-9_.-]+) (?P<fields>.*)$")
 
 # Guest-visible work. With --deterministic and the same inputs these are
 # identical on every run; a change that moves them changed what the guest did.
-# `irq` (interrupts and exceptions taken) is missing from binaries older than
-# it, and is compared only when both sides report it.
-WORKLOAD = ("packets", "cycles", "mmio_r", "mmio_w", "events", "irq")
+# `irq` (interrupts and exceptions taken) and `irq_latched` (host-raised
+# interrupts that set a new ILAT bit) are missing from binaries older than
+# them, and are compared only when both sides report them.
+WORKLOAD = ("packets", "cycles", "mmio_r", "mmio_w", "irq", "irq_latched")
 # Host-side shape of the same work: legitimately changed by an optimization
-# that, say, forms longer blocks. Reported, never gated.
-SHAPE = ("runs", "translated")
+# that, say, forms longer blocks. Reported, never gated. `events` counts the
+# CPU queue's callbacks: an asserted interrupt level is raised again after
+# every block until the guest takes it, so delivering fewer of those
+# repeats changes nothing the guest sees.
+SHAPE = ("runs", "translated", "events")
 # Host cost (--profile-counters, all threads' CPU): what is being measured,
 # never part of a workload comparison.
 HOST_COST = ("host_insns", "host_cycles", "process_cpu_ms")
@@ -92,3 +98,38 @@ def workload_diff(left: List[Mark], right: List[Mark]) -> List[str]:
                 delta = (b[key] - a[key]) / a[key] * 100 if a[key] else float("inf")
                 problems.append(f"{name}.{key}: {a[key]} vs {b[key]} ({delta:+.3f}%)")
     return problems
+
+
+def parse_phase(text: str) -> Tuple[str, str]:
+    begin, _, end = text.partition(":")
+    if not begin or not end:
+        raise ValueError(f"a phase is BEGIN:END, got {text!r}")
+    return begin, end
+
+
+def mark_order(marks_file: Path) -> List[str]:
+    """Marks in the order a marks file lists them, the frame mark last. The
+    profiler does not impose it (any armed range can fire first), so it is a
+    contract on the file that perf.check_fired() verifies after each capture."""
+    config = json.loads(Path(marks_file).read_text())
+    order = ["start"] + [m["name"] for m in config["marks"]]
+    if "frame" in config:
+        order.append(config["frame"]["name"])
+    return order
+
+
+def check_phase(marks_file: Path, phase: Tuple[str, str], until: str) -> Optional[str]:
+    """Before any run: the phase and --until name marks of the file, the
+    phase is not empty, and the run does not stop before the phase ends."""
+    order = mark_order(marks_file)
+    begin, end = phase
+    for name in (begin, end, until):
+        if name not in order:
+            return f"unknown mark {name!r} (the marks file has {order})"
+    # An inverted window records nothing and looks merely empty, not wrong.
+    if order.index(begin) >= order.index(end):
+        return f"phase {begin}:{end} is empty: {begin} does not come before {end}"
+    # Stopping first would leave the phase open and the end mark missing.
+    if order.index(until) < order.index(end):
+        return f"--until {until} comes before the phase end {end}"
+    return None
