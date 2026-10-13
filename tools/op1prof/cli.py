@@ -8,7 +8,7 @@ import time
 from typing import List
 from pathlib import Path
 
-from . import ab, census, compilation, diverge, machine, perf, probes, stats, trace, verify
+from . import ab, census, compilation, diverge, machine, perf, probes, service, stats, trace, verify
 from . import report as perf_report
 from .categories import Categories
 from . import marks as marks_file
@@ -458,6 +458,25 @@ def cmd_census(args) -> int:
     return 0
 
 
+def cmd_service(args) -> int:
+    try:
+        begin, end = marks_file.parse_phase(args.phase)
+        data = service.phase(args.run / "census", begin, end)
+        if args.capture:
+            perf_report.check_same_run(args.capture, args.run)
+            priced = perf_report.analyze(args.capture, Categories.load(), perf_report.Labels())
+            # The capture's own binary snapshot: which classes define the method.
+            binary = Path(json.loads((args.capture / "run" / "run.json").read_text())["binary"])
+            data = service.join(data, priced, service.implementing_classes(binary))
+    except (OSError, ValueError, KeyError, RuntimeError) as error:
+        print(f"service: {error}", file=sys.stderr)
+        return 2
+    if args.json:
+        args.json.write_text(json.dumps(data, indent=1) + "\n")
+    print(service.report(data, args.top))
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="op1prof", description="Measure op1emu profiling builds.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -557,6 +576,16 @@ def main(argv=None) -> int:
     p.add_argument("--edges", action="store_true", help="block-to-block transitions instead of per-block counts")
     p.add_argument("--mmio-first", action="store_true", help="MMRs first accessed in the phase, in order")
     p.set_defaults(func=cmd_census)
+
+    p = sub.add_parser("service", help="device service calls, the interrupt chain and the event queue of a --census run")
+    p.add_argument("run", type=Path, help="run directory holding census.* files")
+    p.add_argument("--phase", required=True, help="BEGIN:END")
+    p.add_argument("--capture", type=Path,
+                   help="capture/ directory of an op1prof perf run (--call-graph lbr) with the same workload: "
+                        "time per device call")
+    p.add_argument("--top", type=int, default=25)
+    p.add_argument("--json", type=Path, help="also write the report as JSON")
+    p.set_defaults(func=cmd_service)
 
     p = sub.add_parser("probes", help="what the probes of a run --probes captured, and the mark reads")
     p.add_argument("run", type=Path, help="run directory (or trace.json)")

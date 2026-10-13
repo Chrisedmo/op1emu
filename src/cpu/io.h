@@ -43,11 +43,30 @@ public:
 
     virtual void ProcessWithInterrupt(int ivg) {}
 
+    // What a service call moved or completed (DMA, TWI, USB: bytes; RTC: a
+    // completed register write; NFC: the flash turning ready), for the
+    // profiling build's service census; nothing in a normal build. A device
+    // that reports nothing here can still be doing work the census cannot
+    // see: "productive" is a lower bound.
+    void CountServiceWork(uint64_t amount) {
+#ifdef ENABLE_PROFILING
+        serviceWork_ += amount;
+#else
+        (void)amount;
+#endif
+    }
+#ifdef ENABLE_PROFILING
+    uint64_t ServiceWork() const { return serviceWork_; }
+#endif
+
 protected:
     std::string name;
     u32 baseAddress;
     u32 size;
     std::map<int, InterruptHandler> interruptHandlers;
+#ifdef ENABLE_PROFILING
+    uint64_t serviceWork_ = 0;
+#endif
 };
 
 class MemoryDevice : public Device {

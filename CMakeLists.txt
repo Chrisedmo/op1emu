@@ -96,8 +96,11 @@ option(ENABLE_PROFILING "Build the profiling hooks: phase marks, trace, census, 
 set(BCORE_ENABLE_PROFILE ${ENABLE_PROFILING} CACHE BOOL "bcore observability API (follows ENABLE_PROFILING)" FORCE)
 set(BCORE_PERF_JIT_EVENTS ${ENABLE_PROFILING} CACHE BOOL "bcore jitdump support (follows ENABLE_PROFILING)" FORCE)
 if(ENABLE_PROFILING)
-    # perf call graphs through host code need frame pointers.
-    add_compile_options(-fno-omit-frame-pointer)
+    # perf call graphs through host code need frame pointers, and every
+    # caller's frame: a tail call (RTC::ProcessWithInterrupt ends in a jump
+    # to RTC::UpdateInterrupts) drops it from frame-pointer and LBR chains
+    # alike, and its callee's time lands on the caller's caller.
+    add_compile_options(-fno-omit-frame-pointer -fno-optimize-sibling-calls)
 endif()
 
 add_subdirectory(ext/bcore EXCLUDE_FROM_ALL)
@@ -160,6 +163,9 @@ if(OP1_BUILD_HEADLESS_TESTS)
         add_executable(op1-mark-set-test tests/mark_set_test.cpp src/profiling/mark_set.cpp)
         target_include_directories(op1-mark-set-test PRIVATE src)
         add_test(NAME op1-mark-set-test COMMAND op1-mark-set-test)
+        add_executable(op1-service-stats-test tests/service_stats_test.cpp)
+        target_link_libraries(op1-service-stats-test PRIVATE emulator Threads::Threads)
+        add_test(NAME op1-service-stats-test COMMAND op1-service-stats-test)
     endif()
 
     find_package(Python3 COMPONENTS Interpreter)

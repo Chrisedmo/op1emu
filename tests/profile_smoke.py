@@ -4,7 +4,8 @@
 Runs op1emu with marks, trace and census on the one-RTS LDR of ldr_smoke.py
 and a small erased NAND image, then checks what it recorded: the build line,
 the start and range marks, a v4 trace with the JIT cache flush at the L1
-entry, census dumps whose block-to-block transitions match the block runs,
+entry, census dumps whose block-to-block transitions match the block runs, a
+service census,
 and that wrong options fail before the CPU starts.
 
 usage: profile_smoke.py OP1EMU
@@ -63,6 +64,11 @@ def check(op1emu, work):
         # next block dumps: at every mark, out of each block equals its runs.
         if out != runs:
             return f"census at {mark}: transitions out {out} do not match block runs {runs}"
+        service = json.loads((work / f"census.service.{mark}").read_text())
+        names = [source["name"] for source in service["sources"]]
+        if service.get("schema") != "op1.service.v1" or names[-3:] != ["block", "events", "other"] or \
+                service["bcore"]["blocks_executed"] != sum(runs.values()):
+            return f"service census at {mark}: {({k: v for k, v in service.items() if k != 'sources'})}, {names}"
 
     # Wrong settings fail before the CPU starts.
     (work / "other.json").write_text(json.dumps({**marks, "nand_sha256": "0" * 64}))

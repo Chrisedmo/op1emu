@@ -106,6 +106,7 @@ void RTC::Tick() {
     if (writePending) {
         writePending = false;
         writeComplete = true;
+        CountServiceWork(1);
     }
 
     // Check for second tick

@@ -15,6 +15,7 @@ from . import census, trace
 from .perf import is_software_event
 from .categories import Categories
 from .marks import Mark, parse_marks, workload_diff
+from .runner import RUN_FILE
 
 SCHEMA = "op1prof.report.v1"
 # Below this share of execution weight with a call chain that reaches the
@@ -201,19 +202,54 @@ def _marks(entries: List[dict]) -> List[Mark]:
                  counters={k: v for k, v in e.items() if k not in keys}) for e in entries]
 
 
-def join_census(result: Attribution, census_run: Path, capture_marks: List[Mark], window: Tuple[str, str],
-                labels: Labels, seconds_per_weight: float) -> dict:
-    """Executed work from a census run of the same binary and inputs, priced
-    by the capture's samples: seconds per block and per execution. The
-    census changes timing, so it always comes from another run, and only a
-    run that did exactly the same guest work may be joined."""
-    log = census_run / "log.txt"
-    if not log.is_file():
+def _run_entry(directory: Path) -> dict:
+    path = directory / RUN_FILE
+    if not path.is_file():
+        raise ValueError(f"{directory}: no {RUN_FILE} (recorded by an older op1prof); record the run again")
+    return json.loads(path.read_text())
+
+
+def check_same_run(capture: Path, census_run: Path) -> None:
+    """A census run may price a capture's samples only if it is the same run
+    in all but timing: the same binary and inputs, the same guest work, and
+    the same blocks (a count per block is what the samples are divided by,
+    and the workload gate deliberately ignores block counts)."""
+    if not (census_run / "log.txt").is_file():
         raise ValueError(f"{census_run}: no log.txt; pass the run/ directory of `op1prof run --census`")
-    census_marks = parse_marks(log.read_text(errors="replace").splitlines())
+    capture_run, census = _run_entry(capture / "run"), _run_entry(census_run)
+    if not capture_run.get("binary_sha256") or capture_run["binary_sha256"] != census.get("binary_sha256"):
+        raise ValueError("the census run used another binary than the capture "
+                         f"({census.get('binary_sha256')} vs {capture_run.get('binary_sha256')})")
+    for key, value in capture_run.get("inputs", {}).items():
+        if census.get("inputs", {}).get(key) != value:
+            raise ValueError(f"the census run read another input than the capture: {key}")
+    # Settings the guest sees (an RTC epoch, the input script): equal counts
+    # do not prove equal state.
+    for key in ("guest_args", "script_sha256"):
+        if key not in capture_run or key not in census:
+            raise ValueError(f"a run.json without {key} (recorded by an older op1prof); record the run again")
+        if capture_run[key] != census[key]:
+            raise ValueError(f"the census run had another {key.replace('_sha256', '')} than the capture "
+                             f"({census[key]} vs {capture_run[key]})")
+    capture_marks, census_marks = _marks(capture_run["marks"]), _marks(census["marks"])
     diff = workload_diff(capture_marks, census_marks)
     if diff:
         raise ValueError("the census run did different guest work than the capture: " + "; ".join(diff[:5]))
+    census_by = {m.name: m for m in census_marks}
+    for mark in capture_marks:
+        other = census_by.get(mark.name)
+        if other and other.counters.get("runs") != mark.counters.get("runs"):
+            raise ValueError(f"the census run executed another number of blocks than the capture at {mark.name} "
+                             f"({other.counters.get('runs')} vs {mark.counters.get('runs')})")
+
+
+def join_census(result: Attribution, census_run: Path, capture: Path, window: Tuple[str, str],
+                labels: Labels, seconds_per_weight: float) -> dict:
+    """Executed work from a census run of the same binary and inputs, priced
+    by the capture's samples: seconds per block and per execution. The
+    census changes timing, so it always comes from another run, and only
+    the same run in all but timing may be joined (check_same_run)."""
+    check_same_run(capture, census_run)
     counts: Dict[str, List[int]] = {}
     for pc, (runs, packets) in census.phase(census_run / "census", "pc", *window).items():
         row = counts.setdefault(labels(pc), [0, 0])
@@ -282,7 +318,7 @@ def analyze(capture: Path, categories: Categories, labels: Labels, callers_of: O
         if not inclusive:
             raise ValueError(f"the census join needs whole call chains, but only {complete_pct:.1f}% reach the "
                              "CPU loop: capture with --call-graph lbr")
-        data["census"] = join_census(result, census_run, _marks(info["run"]["marks"]), window, labels, per_weight)
+        data["census"] = join_census(result, census_run, capture, window, labels, per_weight)
     return data
 
 

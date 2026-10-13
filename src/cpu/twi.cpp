@@ -165,6 +165,7 @@ void TWI::ProcessMasterTransfer() {
                 masterTransferError = true;
             } else {
                 masterDCNT -= bytesRead;
+                CountServiceWork(bytesRead);
                 for (size_t i = 0; i < bytesRead; i++) {
                     rcvFifo.push(data[i]);
                 }
@@ -207,6 +208,7 @@ void TWI::ProcessMasterTransfer() {
                 masterEnable = false;
             } else {
                 masterDCNT -= bytesWrite;
+                CountServiceWork(bytesWrite);
                 if (masterDCNT == 0) {
                     masterTransferComplete = true;
                 }

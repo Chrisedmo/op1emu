@@ -1,5 +1,5 @@
 {
-  "comment": "Host-path buckets for `op1prof report`. Each execution sample goes to the bucket of the frame nearest its leaf that matches any rule; within one frame the first rule in this list wins. A pattern matches where it starts a name in the demangled symbol (so Bus:: does not match DMABus::). Samples whose stack reaches no root have a broken call chain and are counted apart.",
+  "comment": "Host-path buckets for `op1prof report`. Each execution sample goes to the bucket of the frame nearest its leaf that matches any rule; within one frame the first rule in this list wins. A pattern matches where it starts a name in the demangled symbol (so Bus:: does not match DMABus::). Samples whose stack reaches no root have a broken call chain and are counted apart. RegisterDevice:: (a device's register map) is deliberately no rule: a device reading its own registers is that device's time, and a guest access to them is a memory callback through the frames above it.",
   "roots": ["BlackFinCpu::Run(", "BootExcutionThread(", "LdrExecutionThread("],
   "categories": [
     {"name": "profiler",         "match": ["Profiler::", "FrameTap::"]},
@@ -13,7 +13,7 @@
     {"name": "interrupts",       "match": ["SIC::", "cec_", "BlackFinCpu::ProcessInterrupt("]},
     {"name": "gpio/twi/sensors", "match": ["GPIO", "TWI::", "I2CPeripheral", "RegisterI2CPeripheral", "DummyI2CPeripheral", "MCP230XX::", "ADXL345::", "Potentiometer::", "Keyboard::"]},
     {"name": "event queue",      "match": ["BlackFinCpu::ProcessEvents(", "BlackFinCpu::QueueEvent("]},
-    {"name": "memory callbacks", "match": ["EmulatorMemory::", "MemoryDevice::", "RegisterDevice::", "FastMem::", "EBIU::", "Bus::"]},
+    {"name": "memory callbacks", "match": ["mem_read", "mem_write", "Emulator::Memory", "EmulatorMemory::", "MemoryDevice::", "FastMem::", "EBIU::", "Bus::"]},
     {"name": "generated code",   "match": ["bb_0x"]},
     {"name": "dispatch",         "match": ["Core::run(", "JitEngine::lookup("]},
     {"name": "cpu loop",         "match": ["BlackFinCpu::"]}

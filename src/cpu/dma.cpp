@@ -335,7 +335,7 @@ static constexpr u32 MDMA_BURST_BYTES = 4096;
 void DMA::ProcessWithInterrupt(int ivg) {
     for (auto& channel : channels) {
         if (!channel->IsMDMA()) {
-            channel->ProcessTransfer();
+            CountServiceWork(channel->ProcessTransfer());
             continue;
         }
         u32 total = 0;
@@ -344,6 +344,7 @@ void DMA::ProcessWithInterrupt(int ivg) {
             if (!moved) break;
             total += moved;
         }
+        CountServiceWork(total);
     }
 }
 

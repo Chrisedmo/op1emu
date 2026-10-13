@@ -207,6 +207,7 @@ void NFC::SetNotBusy(bool value) {
     notBusy = value;
     if (notBusy && !oldNotBusy) {
         notBusyRising = true;
+        CountServiceWork(1);
     }
 }
 

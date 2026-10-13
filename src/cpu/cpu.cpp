@@ -18,6 +18,10 @@
 #include "emu.h"
 #ifdef ENABLE_PROFILING
 #include "profiling/profiler.h"
+#include "profiling/service_stats.h"
+#include <cstdlib>
+#include <cxxabi.h>
+#include <typeinfo>
 #endif
 #include "peripheral/mcp230xx.h"
 #include "peripheral/adxl345.h"
@@ -197,16 +201,17 @@ BlackFinCpu::BlackFinCpu(bool deterministic) : time_(deterministic), pc(0) {
     sic = std::make_shared<SIC>(0xFFC00100);
     sic->SetInterruptForwardCallback([this](int ivg, int level) {
         if (level) {
-            QueueEvent([this, ivg]() { RaiseInterrupt(ivg); });
+#ifdef ENABLE_PROFILING
+            if (auto* stats = Service()) stats->Forwarded(ivg);
+#endif
+            QueueRaise(ivg);
         }
     });
     devices.push_back(sic);
     nfc->SetIVGResolver([this]() { return sic->GetIVG(IRQ_NFC); });
     coreTimer = std::make_shared<CoreTimer>(0xFFE03000, time_);
     coreTimer->BindInterrupt(IVG_IVTMR, [this](int ivg, int level) {
-        if (level) {
-            QueueEvent([this, ivg]() { RaiseInterrupt(ivg); });
-        }
+        if (level) QueueRaise(ivg);
     });
     devices.emplace_back(coreTimer);
 
@@ -305,6 +310,9 @@ BlackFinCpu::~BlackFinCpu() {
 }
 
 void BlackFinCpu::ProcessInterrupt(int pin, int level) {
+#ifdef ENABLE_PROFILING
+    if (auto* stats = Service()) stats->Published(pin, level);
+#endif
     sic->SetInterruptLevel(pin, level);
 }
 
@@ -347,6 +355,9 @@ HaltReason BlackFinCpu::Run() {
         if (profiler_) profiler_->AfterInvalidate();
 #endif
     }
+#ifdef ENABLE_PROFILING
+    if (auto* stats = Service()) stats->current = stats->block;
+#endif
     // Execute one basic block — bcore updates cpuState_->pc internally.
     // Hardware loops, PC advance, and hwloop counters are all handled by bcore.
     if (!core_->run(cpuState_->pc)) {
@@ -365,6 +376,12 @@ HaltReason BlackFinCpu::Run() {
 
     // Get active IVG from CEC
     int ivg = cec_current_ivg();
+#ifdef ENABLE_PROFILING
+    if (auto* stats = Service()) {
+        stats->current = stats->other;
+        ServiceDevicesCounted(ivg);
+    } else
+#endif
     for (const auto& device : devices) {
         device->ProcessWithInterrupt(ivg);
     }
@@ -389,7 +406,12 @@ HaltReason BlackFinCpu::Run() {
     uint64_t ticks = ((uint64_t)cyclesElapsed - lastTimerCycles_) / kCyclesPerTimerTick;
     if (ticks) {
         lastTimerCycles_ += ticks * kCyclesPerTimerTick;
-        if (ticks > kMaxCatchupTicks) ticks = kMaxCatchupTicks;
+        if (ticks > kMaxCatchupTicks) {
+#ifdef ENABLE_PROFILING
+            if (auto* stats = Service()) stats->timerTicksDropped += ticks - kMaxCatchupTicks;
+#endif
+            ticks = kMaxCatchupTicks;
+        }
         for (uint64_t i = 0; i < ticks; ++i) {
             gptimer->Tick(GPTimerClockTypeSCLK);
             gptimer->Tick(GPTimerClockTypeTACLK);
@@ -472,7 +494,82 @@ u32 BlackFinCpu::PC() {
 void BlackFinCpu::QueueEvent(const std::function<void()>& event, std::chrono::nanoseconds delay) {
     std::unique_lock<std::recursive_mutex> lock(eventQueueMutex);
     eventQueue.push_back({delay, event});
+#ifdef ENABLE_PROFILING
+    if (auto* stats = Service()) stats->Queued();
+#endif
 }
+
+void BlackFinCpu::QueueRaise(int ivg) {
+#ifdef ENABLE_PROFILING
+    if (auto* stats = Service()) stats->SetRaising(true);
+#endif
+    QueueEvent([this, ivg]() { RaiseInterrupt(ivg); });
+#ifdef ENABLE_PROFILING
+    if (auto* stats = Service()) stats->SetRaising(false);
+#endif
+}
+
+#ifdef ENABLE_PROFILING
+static std::string Demangled(const std::type_info& type) {
+    int status = 0;
+    char* name = abi::__cxa_demangle(type.name(), nullptr, nullptr, &status);
+    std::string out = status == 0 && name ? name : type.name();
+    std::free(name);
+    return out;
+}
+
+// Base classes depth first, nearest first: the order a lookup of an inherited
+// member searches them in when only one base declares it.
+static void AddBases(const std::type_info& type, std::vector<std::string>& out) {
+    if (auto* single = dynamic_cast<const abi::__si_class_type_info*>(&type)) {
+        out.push_back(Demangled(*single->__base_type));
+        AddBases(*single->__base_type, out);
+    } else if (auto* multiple = dynamic_cast<const abi::__vmi_class_type_info*>(&type)) {
+        for (unsigned i = 0; i < multiple->__base_count; ++i) {
+            const auto& base = *multiple->__base_info[i].__base_type;
+            out.push_back(Demangled(base));
+            AddBases(base, out);
+        }
+    }
+}
+
+profiling::ServiceStats& BlackFinCpu::EnableServiceStats() {
+    if (serviceStats_) return *serviceStats_;
+    std::vector<profiling::ServiceStats::DeviceInfo> infos;
+    for (const auto& device : devices) {
+        const auto& value = *device;
+        profiling::ServiceStats::DeviceInfo info{device->Name(), Demangled(typeid(value)), {}};
+        // The base classes, so a report can find the ProcessWithInterrupt a
+        // device inherits (GPIO, SPORT and most others run Device's).
+        AddBases(typeid(value), info.bases);
+        infos.push_back(std::move(info));
+    }
+    serviceStats_ = std::make_unique<profiling::ServiceStats>();
+    serviceStats_->SetDevices(infos);
+    // Published last: the USB/IP thread reads it.
+    service_.store(serviceStats_.get(), std::memory_order_release);
+    return *serviceStats_;
+}
+
+// The device loop of Run() with each call counted, and counted as productive
+// when it changed an interrupt level, queued an event other than a raise, or
+// moved data. Taken only in census runs.
+void BlackFinCpu::ServiceDevicesCounted(int ivg) {
+    auto& stats = *Service();
+    for (size_t i = 0; i < devices.size(); ++i) {
+        auto& source = stats.sources[i];
+        const uint64_t before = source.transitions + source.queued;
+        const uint64_t work = devices[i]->ServiceWork();
+        stats.current = static_cast<int>(i);
+        devices[i]->ProcessWithInterrupt(ivg);
+        const uint64_t moved = devices[i]->ServiceWork() - work;
+        source.work += moved;
+        ++source.calls;
+        if (moved || source.transitions + source.queued != before) ++source.productive;
+    }
+    stats.current = stats.other;
+}
+#endif
 
 void BlackFinCpu::RaiseInterrupt(int ivg) {
 #ifdef ENABLE_PROFILING
@@ -481,6 +578,7 @@ void BlackFinCpu::RaiseInterrupt(int ivg) {
     // something the guest can see.
     const uint32_t ilatAddr = CEC_MMR_BASE + 4 * CEC_IDX_ILAT;
     const uint32_t before = cec_mmr_read(cpuState_.get(), ilatAddr);
+    if (auto* stats = Service(); stats && ivg >= 0 && ivg < 16) ++stats->raised[ivg];
     cec_raise(cpuState_.get(), ivg);
     const uint32_t latched = cec_mmr_read(cpuState_.get(), ilatAddr) & ~before;
     for (int level = 0; level < 16; ++level)
@@ -493,6 +591,16 @@ void BlackFinCpu::RaiseInterrupt(int ivg) {
 void BlackFinCpu::ProcessEvents() {
     std::unique_lock<std::recursive_mutex> lock(eventQueueMutex);
     constexpr std::chrono::nanoseconds instructionTime(1); // Approximate instruction execution time
+#ifdef ENABLE_PROFILING
+    if (auto* stats = Service()) {
+        const uint64_t length = eventQueue.size();
+        ++stats->processCalls;
+        stats->nonEmptyCalls += length != 0;
+        stats->lengthSum += length;
+        if (length > stats->lengthMax) stats->lengthMax = length;
+        stats->current = stats->events;
+    }
+#endif
     auto events = eventQueue;
     for (auto& [delay, event] : events) {
         if (delay <= std::chrono::nanoseconds(0)) {
@@ -513,6 +621,9 @@ void BlackFinCpu::ProcessEvents() {
         }
     }
     elapsedTime += instructionTime;
+#ifdef ENABLE_PROFILING
+    if (auto* stats = Service()) stats->current = stats->other;
+#endif
 }
 
 void BlackFinCpu::AttachDisplay(const std::shared_ptr<Display>& display) {

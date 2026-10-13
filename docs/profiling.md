@@ -14,7 +14,13 @@ cmake --build build-prof --target op1emu
 ```
 
 `ENABLE_PROFILING=ON` also turns on bcore's observability API and jitdump
-support (`BCORE_ENABLE_PROFILE`, `BCORE_PERF_JIT_EVENTS`) and frame pointers.
+support (`BCORE_ENABLE_PROFILE`, `BCORE_PERF_JIT_EVENTS`), frame pointers,
+and no tail calls (`-fno-optimize-sibling-calls`): a function that ends by
+jumping to another drops out of every call chain, frame-pointer and LBR
+alike, and its callee's time is charged to its caller's caller. Before
+this, `RTC::UpdateInterrupts` showed 22.8 s inclusive under
+`BlackFinCpu::Run` and only 5.4 s under `RTC::ProcessWithInterrupt`, which
+ends with it.
 With it OFF (the default) none of the hooks below exist in the binary, and the
 profiling options are rejected.
 
@@ -172,7 +178,7 @@ makes the emulator exit nonzero. Do not use it. A trace recorded without
 
 `--profile-census PREFIX` writes `PREFIX.pc.MARK`, `PREFIX.mmio.MARK`,
 `PREFIX.mmiofirst.MARK` and `PREFIX.edge.MARK` at every mark, sorted little-endian records with
-cumulative counts:
+cumulative counts, and `PREFIX.service.MARK` (below):
 
 - `pc` (`u32 key, u64, u64`): block entry PC, runs, packets executed from that entry.
 - `mmio` (`u32 key, u64, u64`): MMR address, guest reads, guest writes.
@@ -188,6 +194,59 @@ cumulative counts:
 Difference two marks' files for one phase. The census costs hash-map updates
 per block and per MMR access: it changes timing, so never combine it with a
 timing measurement. The counts themselves do not depend on it.
+
+### Service census
+
+After every block the CPU loop services every device, re-publishes the
+interrupt levels they hold, and drains its event queue. `PREFIX.service.MARK`
+(JSON, `op1.service.v1`, cumulative) counts that work:
+
+- **Sources**: each device in service order (its name, C++ class and base classes), then
+  `block` (MMR accesses while a block runs), `events` (queue callbacks) and
+  `other` (the rest of the loop). Per source: service `calls` (devices
+  only); `published` interrupt levels and the `transitions` among them (a
+  level that differs from the pin's last one); events `queued`, apart from
+  the interrupt `raises` queued; `work`, the data a device moved (DMA: bytes,
+  reported through `Device::CountServiceWork`); and `productive` calls,
+  those that changed a level, queued an event other than a raise, or moved
+  data. Devices report what they move or complete through
+  `Device::CountServiceWork`: DMA, TWI and USB bytes, an RTC register write
+  completing, the NFC's flash turning ready. A device that reports nothing
+  there can still do work the census does not see, so `productive` is a
+  lower bound, not proof that a call was useless.
+- **Pins**: per SIC input, levels published and transitions, and the source
+  that published first.
+- **IVG**: per level, the raises the SIC `forwarded` (it forwards every
+  pending, unmasked pin again whenever any level is published), the raises
+  delivered to the CEC, the new ILAT bits they `latched`, and the entries
+  the guest took.
+- **Queue**: `ProcessEvents` calls, how many found events, the summed and
+  largest queue length.
+- **Other threads**: the USB/IP loop publishes levels and queues events
+  through the USB device. Those are counted apart (`other_threads`) and
+  never attributed to a source or pin, whose state the CPU thread owns. The
+  CPU owns the counts and frees them with itself, never earlier: that
+  thread can publish at any moment, through the same CPU.
+- GP timer ticks dropped by the 64-tick catch-up limit (none should be, in
+  deterministic mode), and bcore's cache hits, misses and blocks executed.
+
+In census runs the device loop is a counted copy, chosen once per block;
+other runs take the plain loop. On a stock boot, between `main-boot` and
+`main-display` (340,049,495 blocks):
+
+- The RTC publishes its interrupt level after every block, and the level
+  never changes; one call completed a register write. The NFC publishes
+  after every block too; 15,830 calls changed its level or saw the flash
+  turn ready. Of 31 devices, 25 never publish or do anything.
+- Priced by an LBR capture, the RTC's service calls take 24.9 s (73 ns
+  each), the DMA's 16.6 s (49 ns; 42,990 calls moved data) and the NFC's
+  8.3 s (25 ns): 49.8 s of 87.2 s of execution. The 25 devices that run
+  `Device`'s empty method add 2.6 s between them, the cost of calling it.
+- The SIC forwarded 602,100 raises for 59,107 new ILAT bits: it forwards
+  every pending pin again whenever any level is published, so the RTC's
+  unchanging level re-raises the NFC's.
+- `ProcessEvents` runs after every block and finds events in 0.11% of the
+  calls.
 
 ## Reads and probes
 
@@ -315,6 +374,7 @@ python3 -m op1prof run    --binary $B $IN --census
 python3 -m op1prof census op1prof-run-*/run --phase main-boot:lap-end
 python3 -m op1prof compile op1prof-run-*/run --phase main-boot:main-display
 python3 -m op1prof census op1prof-run-*/run --phase main-boot:main-display --edges
+python3 -m op1prof service op1prof-run-*/run --phase main-boot:main-display --capture op1prof-perf-*/capture
 python3 -m op1prof diverge op1prof-run-A/run op1prof-run-B/run   # runs made with --checksum N
 python3 -m op1prof perf   --binary $B $IN --window main-boot:main-display
 python3 -m op1prof report op1prof-perf-*/capture --census op1prof-run-*/run --sort ns-per-run
@@ -469,6 +529,22 @@ runs went to the most common one: a block that nearly always continues to
 the same successor is a candidate to join with it, one with many successors
 is not.
 
+`service RUNDIR --phase A:B` reports the service census of a `run --census`:
+the devices that published levels or did anything, with their calls,
+productive calls and what they published; the pins by levels published and
+the share that changed anything; the interrupt chain per IVG; the event
+queue; and dropped timer ticks. The rest of the devices are named in one
+line. `--capture CAPTURE` prices the calls with a perf capture of the same
+run in all but timing (the join is refused otherwise, as for `report --census`): each
+device's price is the inclusive time of the `ProcessWithInterrupt` it runs,
+split by calls among the devices that run the same one, as seconds, ns per
+call and ns per productive call. Most devices inherit `Device`'s empty
+method rather than define their own: the census records each device's base
+classes, and the capture binary's symbol table says which classes define
+the method, so a device is priced by the first of its class and bases that
+does. One whose method cannot be found is shown as `?`, never as a zero. It needs whole call chains (`--call-graph lbr`).
+`--json FILE` writes the report.
+
 `run` and `verify` take `--checksum N` (records every N blocks) and
 `--checksum-from RUNS`. `diverge A B` reports the first record where two runs
 differ, which fields differ, and the window of blocks the divergence lies
@@ -499,7 +575,13 @@ every table is in seconds of execution CPU:
 - **Host-path buckets** from `profiling/categories.json`: each sample goes to
   the bucket of the frame nearest its leaf that matches a rule (a device read
   called from generated code is device time; a `memcpy` takes its caller's
-  bucket). The buckets and `uncategorized` add up to all execution.
+  bucket). The buckets and `uncategorized` add up to all execution. A
+  device's register map (`RegisterDevice::`) has no rule of its own: the RTC
+  reading its own registers after every block is RTC time, and a guest read
+  of them is a memory callback through the frames above. With the register
+  map as a memory callback, and tail calls hiding frames, a stock boot had
+  shown 15.8 s of memory callbacks against 7.9 s now, and the RTC 6.4 s of
+  its 23.2 s.
 - **Guest blocks**: `self` is time in the block's own code, `incl` adds what
   it called (memory callbacks, devices reached through them). `--symbols`
   names blocks; `--pc-range NAME=LO:HI` merges a range, such as a loop that
@@ -529,8 +611,16 @@ totals are only valid per block and symbol.
 `run --census` (the census changes timing, so never the same run) and gives
 each guest block its runs, packets, seconds, **ns per run** and ns per packet,
 plus the cost per run of everything outside guest blocks (dispatch, devices,
-event queue, CPU loop). The census run must have done exactly the capture's
-guest work, or the join is refused. `--sort ns-per-run` ranks blocks by how
+event queue, CPU loop). The census run must be the capture's run in all
+but timing, or the join is refused: the same binary and inputs (each run
+directory has a `run.json` with them), the same extra emulator arguments
+apart from diagnostic ones (an `--rtc-epoch` changes what the guest reads
+without changing what it counts; an argument naming a file, such as an LDR,
+is compared by the file's SHA-256, taken before the run) and the same input
+script, the same
+guest work, and the same
+number of blocks at every mark, since the census's block counts divide the
+samples and the workload gate deliberately ignores them. `--sort ns-per-run` ranks blocks by how
 expensive one execution is rather than by total share. These are sampled
 estimates: their error comes from repeating captures, not from sample counts.
 `--json FILE` writes the whole report for further analysis, and

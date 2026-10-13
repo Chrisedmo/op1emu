@@ -434,6 +434,7 @@ void USB::ProcessTransfer() {
         if ((epTxEnabled & (1 << i))) {
             ep.txBuffer.reserve(ep.txFifo.size() + ep.txBuffer.size());
             if (ep.dataPacketInFIFO) {
+                CountServiceWork(ep.txFifo.size());
                 while (!ep.txFifo.empty()) {
                     ep.txBuffer.push_back(ep.txFifo.front());
                     ep.txFifo.pop();
@@ -442,6 +443,7 @@ void USB::ProcessTransfer() {
                 epTxInterrupts |= (1 << i);
             }
             if (ep.txCallback && ep.txBuffer.size() >= ep.txLimit) {
+                CountServiceWork(ep.txLimit);
                 ep.txCallback(ep.txBuffer.data(), ep.txLimit);
                 ep.txBuffer.erase(ep.txBuffer.begin(), ep.txBuffer.begin() + ep.txLimit);
                 ep.txCallback = nullptr;
@@ -453,6 +455,7 @@ void USB::ProcessTransfer() {
                 size_t maxSize = GetMaxFIFOSize(i);
                 size_t toWrite = std::min(ep.rxBuffer.size(), maxSize - ep.rxFifo.size());
                 writeHostToDeviceFIFO(i, ep.rxBuffer.data(), toWrite);
+                CountServiceWork(toWrite);
                 ep.rxBuffer.erase(ep.rxBuffer.begin(), ep.rxBuffer.begin() + toWrite);
             }
             if (ep.rxFifo.size() > 0) {
@@ -470,6 +473,7 @@ void USB::ProcessTransfer() {
         if (!setupCallback) {
             LogError("USB: No setup packet handler for ep0 DATAEND");
         } else {
+            CountServiceWork(ep0.txBuffer.size());
             setupCallback(ep0.txBuffer.data(), ep0.txBuffer.size());
             ep0.txBuffer.clear();
             setupCallback = nullptr;
