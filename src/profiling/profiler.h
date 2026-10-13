@@ -8,8 +8,8 @@
 //  - phase marks: firmware PC ranges from a JSON file bound to the NAND image,
 //    plus an optional verified-frame mark. Each mark prints one `[mark]` line
 //    of cumulative counters on stdout, so any two marks can be differenced.
-//  - a Chrome/Perfetto trace of translations (with the CPU thread's CPU time
-//    per translation) and of the marks.
+//  - a Chrome/Perfetto trace of translations and JIT cache flushes (with the
+//    CPU thread's CPU time in each) and of the marks.
 //  - optional per-PC, block-to-block and MMIO census dumps at every mark
 //    (diagnostic: they cost time, never enable them for timing).
 //  - optional guest-state checksums every N blocks, to find where two runs
@@ -50,6 +50,8 @@ struct ProfilerOptions {
     bool probes = false;       // --profile-probes: the marks file's probes
     std::vector<uint32_t> dumpIrPcs;  // --profile-dump-ir PC[,PC...]
     std::string dumpIrDir = "ir";     // --profile-dump-dir
+    size_t traceEvents = 262144;      // --profile-trace-events: the recorder's capacity
+    std::string buildInfo;            // the binary's build identity (JSON), for the trace
 
     bool Enabled() const {
         return !marksPath.empty() || !tracePath.empty() || !censusPrefix.empty() ||
@@ -70,6 +72,10 @@ public:
     // Called by BlackFinCpu::Run around each block.
     void BeforeRun(uint32_t pc);
     void AfterRun(uint32_t pc, uint32_t packets);
+    // Called around bcore's cache flush at a boot ROM entry: it rebuilds the
+    // JIT, which is compile-side cost, not execution.
+    void BeforeInvalidate();
+    void AfterInvalidate();
     // Called for every guest access to the MMR space (0xFFC00000 and up).
     void OnMmio(uint32_t addr, bool write);
     // Called by FrameTap with each complete frame (RGB565, scan order).

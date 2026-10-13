@@ -125,8 +125,23 @@ endif()
 add_executable(ldrdump tools/ldrdump.cpp)
 target_link_libraries(ldrdump emulator)
 
+# What the binary was built from (--build-info, and every profiling trace).
+# One header per configuration: a multi-config generator builds Debug and
+# Release from one tree, and CMAKE_BUILD_TYPE names neither.
+set(OP1_BUILD_INFO_DIR "${CMAKE_BINARY_DIR}/generated/$<CONFIG>")
+set(OP1_BUILD_INFO_H "${OP1_BUILD_INFO_DIR}/op1_build_info.h")
+add_custom_target(op1-build-info
+    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${OP1_BUILD_INFO_H}
+            -DBUILD_TYPE=$<CONFIG> -DPROFILING=${ENABLE_PROFILING}
+            "-DCOMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+            -P ${CMAKE_SOURCE_DIR}/cmake/BuildInfo.cmake
+    BYPRODUCTS ${OP1_BUILD_INFO_H}
+    COMMENT "Recording the build's revision")
+
 file(GLOB_RECURSE SOURCES gui/*.cpp)
 add_executable(op1emu ${SOURCES})
+add_dependencies(op1emu op1-build-info)
+target_include_directories(op1emu PRIVATE ${OP1_BUILD_INFO_DIR})
 target_link_libraries(op1emu PRIVATE emulator glfw OpenGL::GL nlohmann_json::nlohmann_json uvw ext Threads::Threads ${CMAKE_DL_LIBS})
 target_include_directories(op1emu PRIVATE ${stb_SOURCE_DIR} ${miniaudio_SOURCE_DIR})
 
@@ -141,12 +156,22 @@ if(OP1_BUILD_HEADLESS_TESTS)
     add_executable(op1-time-source-test tests/time_source_test.cpp)
     target_include_directories(op1-time-source-test PRIVATE src)
     add_test(NAME op1-time-source-test COMMAND op1-time-source-test)
+    if(ENABLE_PROFILING)
+        add_executable(op1-mark-set-test tests/mark_set_test.cpp src/profiling/mark_set.cpp)
+        target_include_directories(op1-mark-set-test PRIVATE src)
+        add_test(NAME op1-mark-set-test COMMAND op1-mark-set-test)
+    endif()
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME op1-ldr-smoke
             COMMAND ${Python3_EXECUTABLE} tests/ldr_smoke.py $<TARGET_FILE:op1emu> $<TARGET_FILE:ldrdump>
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        if(ENABLE_PROFILING)
+            add_test(NAME op1-profile-smoke
+                COMMAND ${Python3_EXECUTABLE} tests/profile_smoke.py $<TARGET_FILE:op1emu>
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        endif()
     endif()
 endif()
 

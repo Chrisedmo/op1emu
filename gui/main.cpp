@@ -6,6 +6,7 @@
 #include "headless.h"
 #include "audio_output_miniaudio.h"
 #include "usbipd.h"
+#include "build_info.h"
 #ifdef ENABLE_PROFILING
 #include "profiling/profiler.h"
 #endif
@@ -104,6 +105,7 @@ static int RunEmulator(int argc, char* argv[]) {
     // Profiling options (profiling builds only; see docs/profiling.md).
     std::string profileMarks, profileTrace, profileCensus, perfFifo, perfWindow, profileUntil;
     std::string profileChecksum, profileChecksumEvery, profileChecksumFrom, profileDumpIr, profileDumpDir;
+    std::string profileTraceEvents;
     bool perfJitdump = false;
     bool profileCounters = false;
     bool profileProbes = false;
@@ -114,6 +116,7 @@ static int RunEmulator(int argc, char* argv[]) {
         {"--profile-checksum", &profileChecksum}, {"--profile-checksum-every", &profileChecksumEvery},
         {"--profile-checksum-from", &profileChecksumFrom},
         {"--profile-dump-ir", &profileDumpIr}, {"--profile-dump-dir", &profileDumpDir},
+        {"--profile-trace-events", &profileTraceEvents},
     };
     bool anyProfiling = false;
     for (int i = 1; i < argc; i++) {
@@ -146,6 +149,10 @@ static int RunEmulator(int argc, char* argv[]) {
             anyProfiling = true;
         }
         else if (options && (arg == "--help" || arg == "-h")) help = true;
+        else if (options && arg == "--build-info") {
+            std::cout << BuildInfoJson() << std::endl;
+            return 0;
+        }
         else if (options && arg == "--input-script") {
             if (++i == argc) throw std::runtime_error("--input-script requires a path");
             inputScript = argv[i];
@@ -163,6 +170,7 @@ static int RunEmulator(int argc, char* argv[]) {
                      "  --deterministic       Guest time from executed instructions, not host time:\n"
                      "                        repeatable runs, as fast as the host allows\n"
                      "  --rtc-epoch SECONDS   RTC time at boot with --deterministic (default 2024-01-01)\n"
+                     "  --build-info          Print what this binary was built from (JSON) and exit\n"
                      "Profiling builds (-DENABLE_PROFILING=ON, see docs/profiling.md):\n"
                      "  --profile-marks FILE  Phase marks (firmware PC ranges, verified frame)\n"
                      "  --profile-trace FILE  Chrome/Perfetto trace of translations and marks\n"
@@ -178,6 +186,7 @@ static int RunEmulator(int argc, char* argv[]) {
                      "  --profile-dump-dir D  Directory for those files (default ir)\n"
                      "  --profile-checksum-every N  Blocks between checksums (default 65536)\n"
                      "  --profile-checksum-from N   First block to checksum (default 0)\n"
+                     "  --profile-trace-events N    Trace capacity in events (default 262144)\n"
                      "Headless commands (one per line):\n"
                      "  keys | press KEY | release KEY | tap KEY [MS] | wait MS | quit\n"
                      "  accel X Y Z | accel random | volume 0..255\n"
@@ -230,6 +239,7 @@ static int RunEmulator(int argc, char* argv[]) {
     if (anyProfiling) {
         ProfilerOptions profile;
         profile.nandPath = positional[0];
+        profile.buildInfo = BuildInfoJson();
         profile.marksPath = profileMarks;
         profile.tracePath = profileTrace;
         profile.censusPrefix = profileCensus;
@@ -265,6 +275,10 @@ static int RunEmulator(int argc, char* argv[]) {
             profile.checksumEvery = count(profileChecksumEvery, "--profile-checksum-every", false);
         if (!profileChecksumFrom.empty())
             profile.checksumFrom = count(profileChecksumFrom, "--profile-checksum-from", true);
+        if (!profileTraceEvents.empty()) {
+            if (profileTrace.empty()) throw std::runtime_error("--profile-trace-events sizes --profile-trace: add it");
+            profile.traceEvents = count(profileTraceEvents, "--profile-trace-events", false);
+        }
         profiler = std::make_unique<Profiler>(profile, cpu, [] { cpuShouldStop.store(true); });
         cpu.SetProfiler(profiler.get());
         // The verified-frame mark sees exactly the pixels the frontend gets.

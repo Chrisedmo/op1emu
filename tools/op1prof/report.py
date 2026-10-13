@@ -142,7 +142,7 @@ def attribute(samples: Iterable[Sample], trace_data: dict, window: Tuple[str, st
     found = trace.marks(trace_data)
     lo, hi = (int(found[name]["ts"] * 1000) for name in window)
     spans = _merged((int(e["ts"] * 1000), int((e["ts"] + e["dur"]) * 1000))
-                    for e in trace_data["traceEvents"] if e.get("name") == "translate")
+                    for e in trace.jit_spans(trace_data))
     starts = [s for s, _ in spans]
     tid = trace_data.get("cpu_thread_tid")
     if tid is None:

@@ -2,6 +2,7 @@
 
 #include "cpu/cpu.h"
 #include "hw_counters.h"
+#include "mark_set.h"
 #include "probes.h"
 #include "sha256.h"
 #include "utils/log.h"
@@ -12,7 +13,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <bitset>
 #include <cctype>
 #include <cerrno>
 #include <cinttypes>
@@ -78,16 +78,14 @@ void CheckName(const std::string& name) {
 } // namespace
 
 struct Profiler::Impl : BcoreEventSink {
-    struct Mark {
+    struct FrameMark {
         std::string name;
-        uint32_t lo = 0, hi = 0;
-        int after = -1;        // index of the mark that must fire first
-        bool inside = false;   // entry-edge state, tracked from the first run
+        int after = -1;  // index of the mark the frame must follow
         bool fired = false;
     };
     struct Counters {
         uint64_t wall_ns = 0, cpu_ns = 0, process_cpu_ns = 0, runs = 0, packets = 0, cycles = 0;
-        uint64_t translated = 0, mmio_r = 0, mmio_w = 0, events = 0;
+        uint64_t translated = 0, invalidations = 0, mmio_r = 0, mmio_w = 0, events = 0;
         uint64_t irq = 0, irqLevels[16] = {};
         uint64_t irqLatched = 0, irqLatchedLevels[16] = {};
         uint64_t hostInsns = 0, hostCycles = 0;  // with --profile-counters
@@ -106,16 +104,8 @@ struct Profiler::Impl : BcoreEventSink {
     BlackFinCpu& cpu;
     std::function<void()> requestStop;
 
-    std::vector<Mark> marks;
-    size_t marksLeft = 0;
-    // Every block passes through CheckMarks while a mark is unfired, so most
-    // must be rejected cheaply: one bit per 32-byte code chunk (modulo 4096)
-    // covered by an unfired mark. A clear bit proves the PC is in no unfired
-    // range; a set bit only means "check properly". Scanning the ranges for
-    // every block cost 2.8% of execution samples on a stock boot.
-    std::bitset<4096> markChunks;
-    size_t marksInside = 0;  // unfired marks whose range held the previous PC
-    Mark frameMark;            // lo/hi unused
+    profiling::MarkSet marks;
+    FrameMark frameMark;
     bool hasFrame = false;
     std::string frameSha;
     uint64_t framesRejected = 0;
@@ -136,6 +126,8 @@ struct Profiler::Impl : BcoreEventSink {
     static constexpr uint64_t kMaxUncountedNs = 1000;
     long cpuTid = 0;  // perf samples carry thread ids; reports keep this one
     uint64_t runs = 0, mmioReads = 0, mmioWrites = 0;
+    uint64_t invalidations = 0;
+    uint64_t invalidateBegin = 0, invalidateCpuBegin = 0, invalidateInsnsBegin = 0;
 
     // Trace: preallocated so recording never allocates on the CPU thread.
     std::vector<Event> events;
@@ -198,11 +190,7 @@ struct Profiler::Impl : BcoreEventSink {
 
     // ---- configuration ----
 
-    int FindMark(const std::string& name) const {
-        for (size_t i = 0; i < marks.size(); ++i)
-            if (marks[i].name == name) return static_cast<int>(i);
-        return -1;
-    }
+    int FindMark(const std::string& name) const { return marks.Find(name); }
     bool KnownMark(const std::string& name) const {
         return name == "start" || FindMark(name) >= 0 || (hasFrame && frameMark.name == name);
     }
@@ -228,22 +216,18 @@ struct Profiler::Impl : BcoreEventSink {
             throw std::runtime_error("Marks file " + options.marksPath + " is for NAND sha256 " + expected +
                                      ", but " + options.nandPath + " is " + (actual.empty() ? "unreadable" : actual));
         for (const auto& entry : json.at("marks")) {
-            Mark mark;
-            mark.name = entry.at("name").get<std::string>();
-            CheckName(mark.name);
-            if (FindMark(mark.name) >= 0) throw std::runtime_error("Duplicate mark: " + mark.name);
-            mark.lo = ParseAddress(entry.at("lo"), mark.name + ".lo");
-            mark.hi = ParseAddress(entry.at("hi"), mark.name + ".hi");
-            if (mark.lo > mark.hi) throw std::runtime_error("Mark " + mark.name + " has lo > hi");
-            LoadReads(mark.name, entry);
+            const auto name = entry.at("name").get<std::string>();
+            CheckName(name);
+            if (FindMark(name) >= 0) throw std::runtime_error("Duplicate mark: " + name);
+            int after = -1;
             if (entry.contains("after")) {
-                mark.after = FindMark(entry.at("after").get<std::string>());
-                if (mark.after < 0) throw std::runtime_error("Mark " + mark.name + " is after an unknown or later mark");
+                after = FindMark(entry.at("after").get<std::string>());
+                if (after < 0) throw std::runtime_error("Mark " + name + " is after an unknown or later mark");
             }
-            marks.push_back(mark);
+            marks.Add(name, ParseAddress(entry.at("lo"), name + ".lo"), ParseAddress(entry.at("hi"), name + ".hi"),
+                      after);
+            LoadReads(name, entry);
         }
-        marksLeft = marks.size();
-        RebuildMarkChunks();
         if (json.contains("frame")) {
             const auto& entry = json.at("frame");
             frameMark.name = entry.at("name").get<std::string>();
@@ -311,8 +295,11 @@ struct Profiler::Impl : BcoreEventSink {
             checksums = std::fopen(options.checksumPath.c_str(), "wb");
             if (!checksums) throw std::runtime_error("Cannot write --profile-checksum " + options.checksumPath);
         }
-        if (!options.tracePath.empty()) events.resize(262144);
-        markCounters.reserve(marks.size() + 2);  // start, the marks, the frame: no allocation later
+        if (!options.tracePath.empty()) {
+            if (options.traceEvents == 0) throw std::runtime_error("--profile-trace-events must be at least 1");
+            events.resize(options.traceEvents);
+        }
+        markCounters.reserve(marks.Marks().size() + 2);  // start, the marks, the frame: no allocation later
         if (options.counters) {
             // Fail before the CPU starts, not with a run that counted nothing.
             // The counters themselves are opened by the CPU thread (Start).
@@ -419,6 +406,7 @@ struct Profiler::Impl : BcoreEventSink {
         c.packets = cpu.Time().Packets();
         c.cycles = cpu.Time().Cycles();
         c.translated = cpu.CoreStats().blocks_translated;
+        c.invalidations = invalidations;
         c.mmio_r = mmioReads;
         c.mmio_w = mmioWrites;
         c.events = cpu.EventsDelivered();
@@ -457,6 +445,25 @@ struct Profiler::Impl : BcoreEventSink {
         Fire("start", pc);
     }
 
+    void BeforeInvalidate() {
+        HwCounters::Values values;
+        if (ReadCounters(values)) invalidateInsnsBegin = values.instructions;
+        invalidateBegin = MonotonicNs();
+        invalidateCpuBegin = ThreadCpuNs();
+    }
+    void AfterInvalidate() {
+        Event event;
+        event.name = "invalidate";
+        event.begin = invalidateBegin;
+        event.end = MonotonicNs();
+        event.cpu_ns = ThreadCpuNs() - invalidateCpuBegin;
+        event.pc = cpu.State().pc;
+        HwCounters::Values values;
+        if (ReadCounters(values)) event.insns = values.instructions - invalidateInsnsBegin;
+        ++invalidations;
+        Add(event);
+    }
+
     void Fire(const char* name, uint32_t pc) {
         const uint64_t wall = MonotonicNs(), cpuNs = ThreadCpuNs();
         Event event;
@@ -470,10 +477,11 @@ struct Profiler::Impl : BcoreEventSink {
         const auto& c = markCounters.back();
         // Cumulative from "start": difference any two marks. tools/op1prof parses this.
         std::printf("[mark] %s pc=0x%08x wall_ms=%.3f cpu_ms=%.3f process_cpu_ms=%.3f runs=%" PRIu64
-                    " packets=%" PRIu64 " cycles=%" PRIu64 " translated=%" PRIu64 " mmio_r=%" PRIu64
+                    " packets=%" PRIu64 " cycles=%" PRIu64 " translated=%" PRIu64 " invalidations=%" PRIu64
+                    " mmio_r=%" PRIu64
                     " mmio_w=%" PRIu64 " events=%" PRIu64 " irq=%" PRIu64 " irq_latched=%" PRIu64,
                     name, pc, c.wall_ns / 1e6, c.cpu_ns / 1e6, c.process_cpu_ns / 1e6, c.runs, c.packets, c.cycles,
-                    c.translated, c.mmio_r, c.mmio_w, c.events, c.irq, c.irqLatched);
+                    c.translated, c.invalidations, c.mmio_r, c.mmio_w, c.events, c.irq, c.irqLatched);
         if (hw.IsOpen() && !countersFailed)
             std::printf(" host_insns=%" PRIu64 " host_cycles=%" PRIu64, c.hostInsns, c.hostCycles);
         std::printf(" deterministic=%d\n", cpu.Time().Deterministic() ? 1 : 0);
@@ -613,48 +621,8 @@ struct Profiler::Impl : BcoreEventSink {
 
     // ---- per run ----
 
-    void RebuildMarkChunks() {
-        markChunks.reset();
-        for (const auto& mark : marks) {
-            if (mark.fired) continue;
-            if ((mark.hi >> 5) - (mark.lo >> 5) >= markChunks.size()) { markChunks.set(); return; }
-            for (uint32_t chunk = mark.lo >> 5; chunk <= mark.hi >> 5; ++chunk) markChunks.set(chunk % markChunks.size());
-        }
-    }
-
-    void CheckMarks(uint32_t pc) {
-        if (!markChunks.test((pc >> 5) % markChunks.size())) {
-            // Outside every unfired range: only the entry-edge state can change.
-            if (marksInside) {
-                for (auto& mark : marks) mark.inside = false;
-                marksInside = 0;
-            }
-            return;
-        }
-        // Every unfired mark tracks entry edges from the first run, so a mark
-        // armed by its `after` mark still needs a fresh entry: "te-boot" shares
-        // the bootrom range with "bootrom" and must not fire on the very next
-        // block. At most one mark fires per run, in file order.
-        int fire = -1;
-        marksInside = 0;
-        for (size_t i = 0; i < marks.size(); ++i) {
-            auto& mark = marks[i];
-            if (mark.fired) continue;
-            const bool in = pc >= mark.lo && pc <= mark.hi;
-            const bool edge = in && !mark.inside;
-            mark.inside = in;
-            marksInside += in;
-            if (edge && fire < 0 && (mark.after < 0 || marks[mark.after].fired)) fire = static_cast<int>(i);
-        }
-        if (fire < 0) return;
-        marks[fire].fired = true;
-        --marksLeft;
-        RebuildMarkChunks();
-        Fire(marks[fire].name.c_str(), pc);
-    }
-
     void OnFrame(const std::vector<uint16_t>& pixels) {
-        if (!hasFrame || frameMark.fired || !marks[frameMark.after].fired) return;
+        if (!hasFrame || frameMark.fired || !marks.Fired(frameMark.after)) return;
         // RGB565 as stored in memory (little-endian), the same bytes a
         // headless screenshot would be computed from before rotation.
         const auto sha = Sha256::Of(pixels.data(), pixels.size() * sizeof(uint16_t));
@@ -664,7 +632,7 @@ struct Profiler::Impl : BcoreEventSink {
             // so a new reference can be chosen from them.
             if (++framesRejected <= 8)
                 LogInfo("Frame %" PRIu64 " after %s rejected: rgb565_sha256=%s", framesRejected,
-                        marks[frameMark.after].name.c_str(), sha.c_str());
+                        marks.Marks()[frameMark.after].name.c_str(), sha.c_str());
             return;
         }
         frameMark.fired = true;
@@ -682,11 +650,12 @@ struct Profiler::Impl : BcoreEventSink {
             LogError("Cannot write trace %s", options.tracePath.c_str());
             return false;
         }
-        std::fprintf(file, "{\"schema\":\"op1.trace.v3\",\"clock\":\"CLOCK_MONOTONIC\",\"process_id\":%d,"
+        std::fprintf(file, "{\"schema\":\"op1.trace.v4\",\"clock\":\"CLOCK_MONOTONIC\",\"process_id\":%d,"
                            "\"cpu_thread_tid\":%ld,\"start_ns\":%" PRIu64 ",\"end_ns\":%" PRIu64 ",\"dropped\":%" PRIu64
-                           ",\"deterministic\":%s,\"counters\":%s,",
-                     static_cast<int>(getpid()), cpuTid, startWall, endWall, lost,
-                     cpu.Time().Deterministic() ? "true" : "false", counted ? "true" : "false");
+                           ",\"capacity\":%zu,\"deterministic\":%s,\"counters\":%s,\"build\":%s,",
+                     static_cast<int>(getpid()), cpuTid, startWall, endWall, lost, events.size(),
+                     cpu.Time().Deterministic() ? "true" : "false", counted ? "true" : "false",
+                     options.buildInfo.empty() ? "null" : options.buildInfo.c_str());
         if (probesOn) {
             std::fputs("\"probes\":", file);
             probes.WriteStats(file);
@@ -700,10 +669,12 @@ struct Profiler::Impl : BcoreEventSink {
                 const auto& c = markCounters[e.counters];
                 std::fprintf(file, "\"cat\":\"mark\",\"ph\":\"i\",\"s\":\"g\",\"args\":{\"pc\":%u,\"wall_ns\":%" PRIu64
                                    ",\"thread_cpu_ns\":%" PRIu64 ",\"runs\":%" PRIu64 ",\"packets\":%" PRIu64
-                                   ",\"cycles\":%" PRIu64 ",\"translated\":%" PRIu64 ",\"mmio_r\":%" PRIu64
+                                   ",\"cycles\":%" PRIu64 ",\"translated\":%" PRIu64 ",\"invalidations\":%" PRIu64
+                                   ",\"mmio_r\":%" PRIu64
                                    ",\"mmio_w\":%" PRIu64 ",\"events\":%" PRIu64 ",\"process_cpu_ns\":%" PRIu64
                                    ",\"irq\":%" PRIu64 ",\"irq_levels\":[",
-                             e.pc, c.wall_ns, c.cpu_ns, c.runs, c.packets, c.cycles, c.translated, c.mmio_r,
+                             e.pc, c.wall_ns, c.cpu_ns, c.runs, c.packets, c.cycles, c.translated, c.invalidations,
+                             c.mmio_r,
                              c.mmio_w, c.events, c.process_cpu_ns, c.irq);
                 for (int level = 0; level < 16; ++level)
                     std::fprintf(file, "%s%" PRIu64, level ? "," : "", c.irqLevels[level]);
@@ -718,6 +689,7 @@ struct Profiler::Impl : BcoreEventSink {
                 std::fputs("}}", file);
             } else {
                 const bool translate = std::strcmp(e.name, "translate") == 0;
+                const bool invalidate = std::strcmp(e.name, "invalidate") == 0;
                 std::fprintf(file, "\"cat\":\"jit\",\"ph\":\"X\",\"dur\":%.3f,\"args\":{\"pc\":%u,\"ok\":%s",
                              (e.end - e.begin) / 1000.0, e.pc, e.ok ? "true" : "false");
                 if (translate) {
@@ -727,7 +699,8 @@ struct Profiler::Impl : BcoreEventSink {
                                  e.cpu_ns, e.shape.ir_instructions, e.shape.ir_blocks, e.shape.object_bytes,
                                  e.shape.object_hash, e.shape.collect_ns);
                 }
-                if (translate && counted) std::fprintf(file, ",\"insns\":%" PRIu64, e.insns);
+                if (invalidate) std::fprintf(file, ",\"cpu_ns\":%" PRIu64, e.cpu_ns);
+                if ((translate || invalidate) && counted) std::fprintf(file, ",\"insns\":%" PRIu64, e.insns);
                 std::fputs("}}", file);
             }
         }
@@ -757,6 +730,8 @@ struct Profiler::Impl : BcoreEventSink {
 Profiler::Profiler(const ProfilerOptions& options, BlackFinCpu& cpu, std::function<void()> requestStop)
     : impl_(std::make_unique<Impl>(options, cpu, std::move(requestStop))) {
     impl_->Configure();
+    // Which binary this is, on the same stream as the marks.
+    if (!options.buildInfo.empty()) std::printf("[build] %s\n", options.buildInfo.c_str());
 }
 
 Profiler::~Profiler() = default;
@@ -780,11 +755,18 @@ void Profiler::BeforeRun(uint32_t pc) {
         impl.framePending = false;
         impl.Fire(impl.frameMark.name.c_str(), pc);
     }
-    if (impl.marksLeft) impl.CheckMarks(pc);
+    if (impl.marks.Left()) {
+        const int fired = impl.marks.OnBlock(pc);
+        if (fired >= 0) impl.Fire(impl.marks.Marks()[fired].name.c_str(), pc);
+    }
     if (impl.checksums && impl.runs >= impl.options.checksumFrom &&
         (impl.runs - impl.options.checksumFrom) % impl.options.checksumEvery == 0)
         impl.WriteChecksum(pc);
 }
+
+void Profiler::BeforeInvalidate() { impl_->BeforeInvalidate(); }
+
+void Profiler::AfterInvalidate() { impl_->AfterInvalidate(); }
 
 void Profiler::AfterRun(uint32_t pc, uint32_t packets) {
     auto& impl = *impl_;
@@ -834,7 +816,7 @@ bool Profiler::Finish() {
     impl.WriteDumps();
     bool ok = impl.WriteTrace() && !impl.censusFailed && !impl.countersFailed && !impl.checksumFailed &&
               !impl.dumpFailed;
-    for (const auto& mark : impl.marks)
+    for (const auto& mark : impl.marks.Marks())
         if (!mark.fired) std::fprintf(stderr, "[profile] mark %s did not fire\n", mark.name.c_str());
     if (impl.probesOn) impl.probes.Report(stderr);
     if (impl.framePending)

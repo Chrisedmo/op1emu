@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from op1prof import ab, cli, machine, stats, trace, verify  # noqa: E402
+from op1prof import ab, census, cli, compilation, machine, stats, trace, verify  # noqa: E402
 from op1prof.marks import parse_mark, workload_diff, parse_marks  # noqa: E402
 from op1prof.runner import RESERVED_ARGS, RunSpec, run, snapshot_binary, sha256_file  # noqa: E402
 
@@ -591,7 +591,8 @@ def test_counters_split_host_instructions_like_cpu(files, tmp_path):
     result = run(spec(files, counters=True), tmp_path / "r")
     assert "--profile-counters" in result.command and result.reached
     phase = trace.phase(trace.load(str(result.trace_path)), "start", "main-frame")
-    assert phase.compile_insns == 15_000_000 and phase.noncompile_insns == 90_000_000
+    # Three translations of 5M instructions and one cache flush of 2M are JIT work.
+    assert phase.compile_insns == 17_000_000 and phase.noncompile_insns == 90_000_000
     assert phase.host_cycles == 2 * phase.insns
     assert phase.other_threads_cpu_ms == pytest.approx(0.0)
     plain = trace.phase(trace.load(str(run(spec(files), tmp_path / "p").trace_path)), "start", "main-frame")
@@ -1185,3 +1186,80 @@ def test_extend_judges_earlier_pairs_by_the_current_gate(files, tmp_path):
     report = json.loads((out / "results.json").read_text())
     assert [p["workload_diff"] for p in report["pairs"]] == [[]] * 6
     assert report["status"] != ab.WORKLOAD_CHANGED and not report["workload_changed"]
+
+
+# ---- build identity, cache flushes, instrumentation ----
+
+def test_cache_flushes_are_jit_time_not_execution():
+    t = _trace([_mark("a", 0, 0, 0), {**_translate(10, 20, 15000), "args": {"cpu_ns": 15000, "pc": 0x100}},
+                {"name": "invalidate", "cat": "jit", "ph": "X", "ts": 40, "dur": 50, "args": {"cpu_ns": 45000}},
+                _mark("b", 1000, 1_000_000, 900_000)])
+    p = trace.phase(t, "a", "b")
+    assert p.translations == 1 and p.invalidations == 1
+    assert p.compile_cpu_ms == pytest.approx(0.060) and p.invalidate_cpu_ms == pytest.approx(0.045)
+    assert p.noncompile_cpu_ms == pytest.approx(0.840)
+    assert "cache flushes: 1, 0.04 ms CPU" in compilation.report(t, ("a", "b"), 5, census.Symbols(None))
+
+
+def test_runs_record_the_build_and_ab_warns_about_different_kinds(files, tmp_path, monkeypatch, capsys):
+    result = run(spec(files, trace_events=1000), tmp_path / "r")
+    assert result.build["schema"] == "op1.build.v1" and result.to_json()["build"] == result.build
+    assert result.command[result.command.index("--profile-trace-events") + 1] == "1000"
+    debug = tmp_path / "debug.sh"
+    debug.write_text(f"#!/bin/sh\nFAKE_BUILD='{{\"build_type\": \"Debug\", \"host\": \"fedcba987654\"}}' "
+                     f"exec {FAKE} \"$@\"\n")
+    debug.chmod(0o755)
+    assert cli.main(["ab", "--base-bin", str(FAKE), "--new-bin", str(debug), "--nand", str(files / "nand.bin"),
+                     "--otp", str(files / "otp.bin"), "--marks", str(files / "marks.json"), "--force",
+                     "--out", str(tmp_path / "ab"), "--timeout", "30", "--progress-timeout", "5"]) in (0, 1)
+    out = capsys.readouterr()
+    assert "builds: base 0123456789ab bcore ba9876543210; new fedcba987654 bcore ba9876543210" in out.out
+    assert "different kinds of build (build_type Release vs Debug)" in out.err
+    report = json.loads((tmp_path / "ab" / "results.json").read_text())
+    assert report["builds"]["kind_differs"] == ["build_type"]
+
+
+def test_an_older_binary_without_a_build_line_still_runs(files, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_BUILD", "none")
+    result = run(spec(files), tmp_path / "r")
+    assert result.reached and result.build is None
+    assert "--profile-trace-events" in RESERVED_ARGS
+
+
+def test_verify_instrumentation_names_the_setting_that_changes_the_workload(files, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(verify, "_counters_unavailable", lambda: None)
+    assert _cli(files, "verify", "--instrumentation", "--out", str(tmp_path / "same")) == 0
+    report = json.loads((tmp_path / "same" / "results.json").read_text())
+    assert [c["name"] for c in report["configurations"]] == ["plain", "census", "probes", "checksum", "counters",
+                                                             "no trace"]
+    assert report["configurations"][2]["skipped"] == "the marks file declares no probes"
+    assert len(report["runs"]) == 5 and report["status"] == "deterministic"
+    commands = [r["command"] for r in report["runs"]]
+    assert "--profile-census" in commands[1] and "--profile-trace" not in commands[-1]
+    capsys.readouterr()
+    monkeypatch.setenv("FAKE_SKEW", "--profile-census")
+    assert _cli(files, "verify", "--instrumentation", "--out", str(tmp_path / "skew")) == 1
+    out = capsys.readouterr().out
+    assert "census    DIFFERENT\n  bootrom.packets: 1000 vs 1001" in out and "checksum  same workload" in out
+    assert "differences found" in out
+    with pytest.raises(SystemExit, match="takes no --runs"):
+        _cli(files, "verify", "--instrumentation", "--runs", "3", "--out", str(tmp_path / "x"))
+
+
+def test_verify_instrumentation_refuses_instrumentation_for_every_configuration(files, tmp_path):
+    # --arg reaches every configuration, the plain one included: a setting
+    # enabled there would be compared with itself.
+    with pytest.raises(SystemExit, match="switches each setting on by itself"):
+        _cli(files, "verify", "--instrumentation", "--arg=--profile-probes", "--out", str(tmp_path / "v"))
+    assert not (tmp_path / "v").exists()
+
+
+@pytest.mark.parametrize("command", ["run", "verify"])
+def test_trace_events_reach_the_emulator(files, tmp_path, command):
+    assert _cli(files, command, "--trace-events", "500000", "--out", str(tmp_path / "o")) == 0
+    report = json.loads((tmp_path / "o" / "results.json").read_text())
+    runs = [report["run"]] if command == "run" else report["runs"]
+    for entry in runs:
+        assert entry["command"][entry["command"].index("--profile-trace-events") + 1] == "500000"
+    with pytest.raises(SystemExit):
+        _cli(files, command, "--trace-events", "0", "--out", str(tmp_path / "z"))

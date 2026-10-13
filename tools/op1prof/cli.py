@@ -35,6 +35,8 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-mem-gb", type=float, default=10.0, help="refuse to start below this MemAvailable")
     parser.add_argument("--force", action="store_true", help="start despite preflight problems (recorded)")
     parser.add_argument("--out", type=Path, default=None, help="results directory (default op1prof-<time>)")
+    parser.add_argument("--trace-events", type=_positive, default=None, metavar="N",
+                        help="trace recorder capacity in events, for runs longer than a stock boot (default 262144)")
 
 
 def _checksum(parser: argparse.ArgumentParser) -> None:
@@ -111,7 +113,8 @@ def _spec(args, binary: Path) -> RunSpec:
                    timeout_s=args.timeout, progress_timeout_s=args.progress_timeout, cpu=args.cpu,
                    counters=getattr(args, "counters", False),
                    checksum_every=getattr(args, "checksum", None), checksum_from=getattr(args, "checksum_from", 0),
-                   probes=getattr(args, "probes", False), dump_pcs=getattr(args, "dump_pc", None) or [])
+                   probes=getattr(args, "probes", False), dump_pcs=getattr(args, "dump_pc", None) or [],
+                   trace_events=getattr(args, "trace_events", None))
 
 
 def _phase(args) -> tuple:
@@ -183,6 +186,8 @@ def cmd_verify(args) -> int:
             raise SystemExit(f"--expect: {error}")
         if not isinstance(saved, dict) or saved.get("schema") != verify.EXPECT_SCHEMA:
             raise SystemExit(f"--expect: {args.expect} is not an op1prof expect file ({verify.EXPECT_SCHEMA})")
+    if args.instrumentation:
+        return _verify_instrumentation(args)
     out = _out(args, "verify")
     report = verify.verify(_spec(args, snapshot_binary(args.binary, out)), args.runs, out,
                            args.expect, args.write_expect)
@@ -192,6 +197,31 @@ def cmd_verify(args) -> int:
         print(f"run {index} against run 0:\n{text}")
     if report["differences"] and not args.checksum:
         print("to find where the runs first differ, repeat with --checksum 65536 and run op1prof diverge")
+    print(f"{report['status']} ({len(report['runs'])} runs; {out / 'results.json'})")
+    return 0 if report["status"] == "deterministic" else 1
+
+
+def _verify_instrumentation(args) -> int:
+    # Each setting is switched on in one configuration only: an --arg that
+    # enabled one everywhere would put it in the plain run as well, and a
+    # change it caused would compare equal.
+    _check_args(args.arg)
+    instrumented = instrument_args(list(args.arg))
+    if instrumented:
+        raise SystemExit(f"verify --instrumentation switches each setting on by itself and refuses "
+                         f"{instrumented} in --arg, which would switch it on in every configuration")
+    if args.expect or args.write_expect or args.checksum or args.counters or args.runs != 2:
+        raise SystemExit("--instrumentation runs every setting once (checksums and counters included); "
+                         "it takes no --runs, --expect, --write-expect, --checksum or --counters")
+    out = _out(args, "verify")
+    report = verify.instrumentation(_spec(args, snapshot_binary(args.binary, out)), out)
+    for entry in report["configurations"]:
+        if "skipped" in entry:
+            print(f"{entry['name']:9s} skipped: {entry['skipped']}")
+        elif "differences" in entry:
+            print(f"{entry['name']:9s} {'same workload' if not entry['differences'] else 'DIFFERENT'}")
+            for line in entry["differences"]:
+                print(f"  {line}")
     print(f"{report['status']} ({len(report['runs'])} runs; {out / 'results.json'})")
     return 0 if report["status"] == "deterministic" else 1
 
@@ -259,6 +289,17 @@ def _print_ab(report: dict, out: Path) -> int:
         low, high = s["ci95_pct"]
         print(f"{metric}: {s['mean_pct']:+.2f}% (95% CI {low:+.2f}..{high:+.2f}), "
               f"{s['wins']}/{s['pairs']} new faster (sign test p={s['sign_test_p']:.3f}) -> {s['verdict']}")
+    builds = report.get("builds")
+    if builds:
+        def revision(build):
+            return (f"{build.get('host')}{'+dirty' if build.get('host_dirty') else ''} bcore {build.get('bcore')}"
+                    f"{'+dirty' if build.get('bcore_dirty') else ''}")
+        print(f"builds: base {revision(builds['base'])}; new {revision(builds['new'])}")
+        if builds["kind_differs"]:
+            print("warning: the sides are different kinds of build ("
+                  + ", ".join(f"{key} {builds['base'].get(key)} vs {builds['new'].get(key)}"
+                              for key in builds["kind_differs"])
+                  + "): the comparison measures the build settings too", file=sys.stderr)
     codegen = report.get("codegen")
     if codegen:
         b, n = codegen["base"], codegen["new"]
@@ -436,6 +477,9 @@ def main(argv=None) -> int:
     p.add_argument("--runs", type=_positive, default=2)
     p.add_argument("--expect", type=Path, help="compare with a saved workload (from --write-expect)")
     p.add_argument("--write-expect", type=Path, help="save the workload when all runs agree")
+    p.add_argument("--instrumentation", action="store_true",
+                   help="one run per instrumentation setting (census, probes, checksums, counters, no trace): "
+                        "none may change the workload")
     _counters(p)
     _checksum(p)
     _common(p)

@@ -14,6 +14,8 @@ Behavior comes from FAKE_* variables (the runner keeps those):
   FAKE_CODE    seed of the compiled code's hashes (default 0); FAKE_NOSHAPE drops them
   FAKE_DIVERGE checksum record from which the data registers differ
   FAKE_SKIP    comma list of marks that never fire
+  FAKE_BUILD   JSON merged into the [build] line ("none": print no line)
+  FAKE_SKEW    OPTION: one more packet per mark step when OPTION is given
   FAKE_ENVLOG  write the received environment here
 """
 import json
@@ -31,10 +33,17 @@ if os.environ.get("FAKE_ENVLOG"):
         json.dump(dict(os.environ), f)
 
 mode = set(filter(None, os.environ.get("FAKE_MODE", "").split(",")))
+build = {"schema": "op1.build.v1", "host": "0123456789ab", "host_dirty": False, "bcore": "ba9876543210",
+         "bcore_dirty": False, "build_type": "Release", "profiling": True, "compiler": "GNU 12.3.0"}
+if os.environ.get("FAKE_BUILD") != "none":
+    build.update(json.loads(os.environ.get("FAKE_BUILD") or "{}"))
+    print("[build] " + json.dumps(build), flush=True)
 scale = float(os.environ.get("FAKE_SCALE", "1.0"))
 work = int(os.environ.get("FAKE_WORK", "1000"))
 if "noise" in mode:
     work += random.randint(1, 50)
+if os.environ.get("FAKE_SKEW") and os.environ["FAKE_SKEW"] in args:
+    work += 1
 until = opt("--profile-until")
 counted = "--profile-counters" in args
 irq = int(os.environ.get("FAKE_IRQ", "3"))
@@ -58,12 +67,21 @@ for step, name in enumerate(names):
                        "ts": (t0 + wall) / 1e3, "dur": 2e6 / 1e3, "args": span})
         wall += 2_000_000
         cpu += 2_000_000
+        if step == 1:
+            # the JIT cache flush at the first boot ROM entry
+            events.append({"name": "invalidate", "cat": "jit", "ph": "X", "pid": 1, "tid": 1,
+                           "ts": (t0 + wall) / 1e3, "dur": 1e6 / 1e3,
+                           "args": {"pc": 0xffa00000, "ok": True, "cpu_ns": 1_000_000,
+                                    **({"insns": 2_000_000} if counted else {})}})
+            wall += 1_000_000
+            cpu += 1_000_000
+            insns += 2_000_000
         execution = int(10_000_000 * scale)
         wall += execution
         cpu += execution
         insns += 5_000_000 + 3 * execution
     counters = {"runs": step * work // 3, "packets": step * work, "cycles": step * work,
-                "translated": step, "mmio_r": step * 7, "mmio_w": step * 5, "events": step * 2, "irq": step * irq,
+                "translated": step, "invalidations": min(step, 1), "mmio_r": step * 7, "mmio_w": step * 5, "events": step * 2, "irq": step * irq,
                 "irq_latched": step * irq}
     host = {"host_insns": insns, "host_cycles": 2 * insns} if counted else {}
     events.append({"name": name, "cat": "mark", "ph": "i", "s": "g", "pid": 1, "tid": 1,
@@ -96,6 +114,7 @@ if opt("--profile-checksum"):
                                 regs, 7, 9))
 if opt("--profile-trace"):
     with open(opt("--profile-trace"), "w") as f:
-        json.dump({"schema": "op1.trace.v3", "dropped": 1 if "dropped" in mode else 0, "counters": counted,
+        json.dump({"schema": "op1.trace.v4", "dropped": 1 if "dropped" in mode else 0, "counters": counted,
+                   "build": None if os.environ.get("FAKE_BUILD") == "none" else build, "deterministic": True,
                    "traceEvents": events}, f)
 sys.exit(3 if "fail" in mode else 0)

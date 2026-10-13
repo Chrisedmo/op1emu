@@ -24,8 +24,9 @@ WORKLOAD = ("packets", "cycles", "mmio_r", "mmio_w", "irq", "irq_latched")
 # that, say, forms longer blocks. Reported, never gated. `events` counts the
 # CPU queue's callbacks: an asserted interrupt level is raised again after
 # every block until the guest takes it, so delivering fewer of those
-# repeats changes nothing the guest sees.
-SHAPE = ("runs", "translated", "events")
+# repeats changes nothing the guest sees. `invalidations` counts JIT cache
+# flushes (at every boot ROM entry).
+SHAPE = ("runs", "translated", "events", "invalidations")
 # Host cost (--profile-counters, all threads' CPU): what is being measured,
 # never part of a workload comparison.
 HOST_COST = ("host_insns", "host_cycles", "process_cpu_ms")

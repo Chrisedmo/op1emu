@@ -104,6 +104,11 @@ def report(trace_data: dict, window: Optional[Tuple[str, str]], limit: int, symb
              f"max {max(cpu_ms):.2f} ms",
              f"translated again: {len(again)} blocks, {sum(len(ts) - 1 for ts in again.values())} extra "
              f"translations, {again_ms / 1e3:.3f} s CPU (the cache is flushed when the boot ROM is re-entered)"]
+    lo, hi = _bounds(trace_data, window)
+    flushes = [e for e in trace.jit_spans(trace_data) if e["name"] == "invalidate" and lo <= e["ts"] < hi]
+    if flushes:
+        lines.append(f"cache flushes: {len(flushes)}, {sum(e['args']['cpu_ns'] for e in flushes) / 1e6:.2f} ms CPU "
+                     "(rebuilding the JIT; part of compile time, not in the translations above)")
     stages = stage_ms(trace_data, window)
     if stages:
         total = sum(stages.values())

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import selectors
 import shutil
@@ -24,7 +25,8 @@ DEFAULT_SCRIPT = "accel 100 -100 500\nvolume 128\nwait 86400000\n"
 # --nand-rw, or a second --profile-until); "--" would turn the rest into
 # positional paths. Extra arguments may not use these.
 RESERVED_ARGS = ("--", "--nand-rw", "--nand-snapshot", "--headless", "--deterministic", "--input-script",
-                 "--profile-marks", "--profile-until", "--profile-trace", "--profile-counters")
+                 "--profile-marks", "--profile-until", "--profile-trace", "--profile-trace-events",
+                 "--profile-counters")
 # Diagnostic instrumentation: it changes timing, so a timing comparison may
 # not switch it on for one side (or for both: census, probes and perf have
 # their own commands). Host counters, which ab may use on both sides, are a
@@ -32,6 +34,8 @@ RESERVED_ARGS = ("--", "--nand-rw", "--nand-snapshot", "--headless", "--determin
 INSTRUMENT_ARGS = ("--profile-census", "--profile-checksum", "--profile-checksum-every", "--profile-checksum-from",
                    "--profile-probes", "--profile-dump-ir", "--profile-dump-dir", "--perf-ctl-fifo",
                    "--perf-window", "--perf-jitdump")
+# The emulator's build identity line (absent from binaries before it).
+BUILD_PREFIX = "[build] "
 # How long an emulator that closed its output may take to exit.
 EXIT_GRACE_S = 60.0
 # A run whose output grows past this is failed and stopped: a stock boot
@@ -90,6 +94,7 @@ class RunSpec:
     progress_timeout_s: float = 900.0
     cpu: Optional[int] = None
     trace: bool = True
+    trace_events: Optional[int] = None   # --profile-trace-events: the recorder's capacity
     census: bool = False
     counters: bool = False    # --profile-counters (needs perf_event_paranoid <= 2)
     checksum_every: Optional[int] = None   # --profile-checksum checksum.bin every N blocks
@@ -117,6 +122,7 @@ class RunResult:
     after: dict
     inputs: dict = field(default_factory=dict)
     cpu: Optional[int] = None
+    build: Optional[dict] = None   # the [build] line: what the binary was built from
 
     @property
     def reached(self) -> bool:
@@ -142,7 +148,7 @@ class RunResult:
             "elapsed_s": self.elapsed_s, "reached": self.reached,
             "marks": [{"name": m.name, "pc": m.pc, "wall_ms": m.wall_ms, "cpu_ms": m.cpu_ms,
                        **m.counters} for m in self.marks],
-            "inputs": self.inputs, "machine_before": self.before, "machine_after": self.after,
+            "inputs": self.inputs, "build": self.build, "machine_before": self.before, "machine_after": self.after,
             "contention": self.contention(),
         }
 
@@ -182,6 +188,8 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
                "--profile-until", spec.until]
     if spec.trace:
         command += ["--profile-trace", "trace.json"]
+        if spec.trace_events:
+            command += ["--profile-trace-events", str(spec.trace_events)]
     if spec.census:
         command += ["--profile-census", "census"]
     if spec.counters:
@@ -199,6 +207,7 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
     inputs = input_hashes(spec)
     before = machine.snapshot(spec.cpu).to_json()
     marks: List[Mark] = []
+    build: Optional[dict] = None
     error: Optional[str] = None
     start = time.monotonic()
     log = open(directory / "log.txt", "wb")
@@ -245,7 +254,14 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
             pending += chunk
             *lines, pending = pending.split(b"\n")
             for line in lines:
-                mark = parse_mark(line.decode(errors="replace"))
+                text = line.decode(errors="replace")
+                if text.startswith(BUILD_PREFIX) and build is None:
+                    try:
+                        build = json.loads(text[len(BUILD_PREFIX):])
+                    except ValueError:
+                        build = {"unparsed": text[len(BUILD_PREFIX):]}
+                    continue
+                mark = parse_mark(text)
                 if mark:
                     marks.append(mark)
                     last_progress = time.monotonic()
@@ -265,4 +281,5 @@ def run(spec: RunSpec, directory: Path) -> RunResult:
         error = f"mark {spec.until!r} never fired"
     return RunResult(directory=directory, command=command, returncode=returncode, marks=marks,
                      error=error, elapsed_s=time.monotonic() - start, before=before,
-                     after=machine.snapshot(spec.cpu).to_json(), until=spec.until, inputs=inputs, cpu=machine.measured_cpu(spec.cpu))
+                     after=machine.snapshot(spec.cpu).to_json(), until=spec.until, inputs=inputs,
+                     cpu=machine.measured_cpu(spec.cpu), build=build)

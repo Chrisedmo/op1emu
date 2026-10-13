@@ -339,7 +339,13 @@ HaltReason BlackFinCpu::Run() {
 #endif
     // Hit entry point, invalidating core to reset cached translations
     if (cpuState_->pc == 0xFFA00000) {
+#ifdef ENABLE_PROFILING
+        if (profiler_) profiler_->BeforeInvalidate();
+#endif
         core_->invalidate();
+#ifdef ENABLE_PROFILING
+        if (profiler_) profiler_->AfterInvalidate();
+#endif
     }
     // Execute one basic block — bcore updates cpuState_->pc internally.
     // Hardware loops, PC advance, and hwloop counters are all handled by bcore.

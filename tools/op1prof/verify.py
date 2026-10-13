@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .marks import SHAPE, WORKLOAD, Mark
 from . import diverge
@@ -83,6 +84,72 @@ def verify(spec: RunSpec, runs: int, out: Path, expect: Optional[Path], write_ex
     if write_expect and not report["differences"]:
         write_expect.write_text(json.dumps({"schema": EXPECT_SCHEMA, "inputs": report["runs"][0]["inputs"],
                                              "marks": tuples[0]}, indent=1) + "\n")
+    report["status"] = "deterministic" if not report["differences"] else "differences found"
+    path.write_text(json.dumps(report, indent=1))
+    return report
+
+
+PARANOID = Path("/proc/sys/kernel/perf_event_paranoid")
+
+
+def _counters_unavailable() -> Optional[str]:
+    try:
+        level = int(PARANOID.read_text())
+    except (OSError, ValueError):
+        return f"cannot read {PARANOID}"
+    return None if level <= 2 else f"kernel.perf_event_paranoid is {level} (counters need at most 2)"
+
+
+def _declares_probes(marks: Path) -> bool:
+    try:
+        return bool(json.loads(marks.read_text()).get("probes"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def configurations(spec: RunSpec) -> List[Tuple[str, Optional[RunSpec], Optional[str]]]:
+    """(name, spec, reason skipped) for every instrumentation setting the
+    profiler offers, the plain marks-and-trace run first."""
+    plain = replace(spec, census=False, counters=False, probes=False, checksum_every=None, dump_pcs=[])
+    probes_skip = None if _declares_probes(spec.marks) else "the marks file declares no probes"
+    counters_skip = _counters_unavailable()
+    return [
+        ("plain", plain, None),
+        ("census", replace(plain, census=True), None),
+        ("probes", None if probes_skip else replace(plain, probes=True), probes_skip),
+        ("checksum", replace(plain, checksum_every=65536), None),
+        ("counters", None if counters_skip else replace(plain, counters=True), counters_skip),
+        ("no trace", replace(plain, trace=False), None),
+    ]
+
+
+def instrumentation(spec: RunSpec, out: Path) -> dict:
+    """One run per instrumentation setting: none may change the guest's
+    work. Uninitialized memory once made the same binary run 1,151,352,850
+    packets to main-display without a trace and 851 with one."""
+    report = {"schema": "op1prof.verify-instrumentation.v1", "runs": [], "configurations": [],
+              "differences": [], "status": "running"}
+    path = out / "results.json"
+    reference = None
+    for index, (name, config, skipped) in enumerate(configurations(spec)):
+        entry = {"name": name}
+        report["configurations"].append(entry)
+        if config is None:
+            entry["skipped"] = skipped
+            path.write_text(json.dumps(report, indent=1))
+            continue
+        result = run(config, out / f"{index:02d}-{name.replace(' ', '-')}")
+        report["runs"].append(result.to_json())
+        if not result.reached:
+            report["status"] = f"failed: {name}: {result.error}"
+            path.write_text(json.dumps(report, indent=1))
+            return report
+        found = _tuple(result.marks)
+        if reference is None:
+            reference = found
+        entry["differences"] = _diff(reference, found)
+        report["differences"] += [f"{name}: {line}" for line in entry["differences"]]
+        path.write_text(json.dumps(report, indent=1))
     report["status"] = "deterministic" if not report["differences"] else "differences found"
     path.write_text(json.dumps(report, indent=1))
     return report

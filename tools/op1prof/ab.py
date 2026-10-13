@@ -200,6 +200,21 @@ def _changed_inputs(report: dict) -> List[str]:
             for e in report["runs"] for key in expected if e.get("inputs", {}).get(key) != expected[key]]
 
 
+# Build properties that make two binaries different kinds of build, not two
+# revisions of one: a timing comparison across them measures the build.
+BUILD_KIND = ("build_type", "profiling", "compiler")
+
+
+def _builds(pairs: List[dict]) -> Optional[dict]:
+    """What each side's binary was built from (the first run's [build] line;
+    a side's runs share one snapshot), and the build properties that differ."""
+    builds = {name: pairs[0][name].get("build") for name in ("base", "new")}
+    if any(b is None for b in builds.values()):
+        return None
+    differs = [key for key in BUILD_KIND if builds["base"].get(key) != builds["new"].get(key)]
+    return {**builds, "kind_differs": differs}
+
+
 def _codegen(pairs: List[dict]) -> Optional[dict]:
     """Did the two sides generate different machine code? A knob that never
     reached code generation (a nonzero opt level once changed nothing for
@@ -277,6 +292,7 @@ def summarize(report: dict, min_effect_pct: float, allow_workload_change: bool, 
     report["summary"] = summary
     report["decided_on"] = decided_on
     report["codegen"] = _codegen(pairs)
+    report["builds"] = _builds(pairs)
     report["drift"] = _drift(report)
     report["contended_pairs"] = sum(1 for p in report["pairs"] if p.get("contended"))
 

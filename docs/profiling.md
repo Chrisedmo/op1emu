@@ -18,6 +18,19 @@ support (`BCORE_ENABLE_PROFILE`, `BCORE_PERF_JIT_EVENTS`) and frame pointers.
 With it OFF (the default) none of the hooks below exist in the binary, and the
 profiling options are rejected.
 
+Every build records what it was built from: `op1emu --build-info` prints one
+line of JSON (`op1.build.v1`) with the host and bcore revisions, whether
+either had uncommitted changes to tracked files, the build type, whether
+profiling is on, and the compiler. A profiling run prints the same object
+as a `[build]` line before its marks and in the trace header (`build`). With a
+multi-config generator each configuration gets its own header, so a Debug and
+a Release binary from one tree say which they are.
+
+`-DOP1_BUILD_HEADLESS_TESTS=ON` adds the firmware-free tests; with profiling
+on they include the mark-firing rule (`op1-mark-set-test`) and a profiling
+run on a synthetic LDR (`op1-profile-smoke`: marks, trace, cache flush,
+census, and options refused before the CPU starts). CI runs both.
+
 Measure with `--deterministic` (see the README): with host time, a slower
 host makes the guest do more work, so two runs never execute the same thing.
 
@@ -26,7 +39,8 @@ host makes the guest do more work, so two runs never execute the same thing.
 | Option | Records |
 |---|---|
 | `--profile-marks FILE` | Phase marks: one `[mark]` line per mark on stdout |
-| `--profile-trace FILE` | Chrome/Perfetto JSON trace of translations and marks |
+| `--profile-trace FILE` | Chrome/Perfetto JSON trace of translations, JIT cache flushes and marks |
+| `--profile-trace-events N` | The trace recorder's capacity (default 262144) |
 | `--profile-census PREFIX` | Per-block, block-to-block and MMIO counts at every mark (diagnostic) |
 | `--profile-until MARK` | Stop cleanly when MARK fires |
 | `--perf-ctl-fifo FIFO` | Control FIFO of `perf record --control=fifo:FIFO` |
@@ -111,20 +125,27 @@ the guest did, not just how fast the host did it.
 
 ## Trace
 
-`--profile-trace` writes `op1.trace.v3` JSON that Perfetto and
+`--profile-trace` writes `op1.trace.v4` JSON that Perfetto and
 `chrome://tracing` open directly. Timestamps are absolute `CLOCK_MONOTONIC`
 microseconds, the clock `perf record -k mono` uses.
 
 - `translate` spans (category `jit`) cover one block translation each, with
   `args.cpu_ns`, the CPU thread's CPU time inside the span. Nested `lift`,
-  `ir-optimize` and `materialize` spans come from bcore. Only the union of
-  `translate` spans is compile time: never add the nested stages to it.
+  `ir-optimize` and `materialize` spans come from bcore.
+- `invalidate` spans (category `jit`, with `args.cpu_ns`) cover bcore's cache
+  flush at every entry to the boot ROM (0xFFA00000): it destroys the compiled
+  code and builds a new JIT. A stock boot flushes twice, before `lap-begin`,
+  for 1.2 and 1.6 ms of CPU: negligible there, but JIT work wherever it
+  happens, and no longer counted as execution.
+- Compile time is the union of `translate` and `invalidate` spans, the JIT's
+  work: never add the nested stages to it.
 - Marks (category `mark`) are instant events carrying the same counters as the
-  `[mark]` line, with `args.thread_cpu_ns`, `args.process_cpu_ns`,
+  `[mark]` line (including `invalidations`, the cache flushes so far), with `args.thread_cpu_ns`, `args.process_cpu_ns`,
   `args.irq_levels` (entries per IVG level, 0 = EMU ... 15 = IVG15) and
   `args.irq_latched_levels` (new ILAT bits per level).
 - With `--profile-counters` the header says `"counters": true` and every
-  `translate` span also has `args.insns`, the instructions retired inside it.
+  `translate` and `invalidate` span also has `args.insns`, the instructions
+  retired inside it.
 - Every successful `translate` span describes the code it produced (bcore's
   `BcoreCompileMetrics`): `ir_insns` and `ir_blocks` of the module as compiled
   (after the IR pipeline), `object_bytes` of machine code, and
@@ -137,11 +158,12 @@ microseconds, the clock `perf record -k mono` uses.
   CPU.
 
 Execution CPU between two marks is their `thread_cpu_ns` difference minus the
-`cpu_ns` of the `translate` spans between them. Unlike wall time, it does not
+`cpu_ns` of the `translate` and `invalidate` spans between them. Unlike wall time, it does not
 grow when the thread is descheduled. Execution instructions are split the same
 way: the marks' `host_insns` difference minus the spans' `insns`.
 
-The recorder holds 262144 events; a trace that overflows reports `dropped` and
+The recorder holds 262144 events unless `--profile-trace-events` says otherwise
+(the header's `capacity`); a trace that overflows reports `dropped` and
 makes the emulator exit nonzero. Do not use it. A trace recorded without
 `--deterministic` is refused by every op1prof command that reads one. The header also records
 `cpu_thread_tid`, the CPU thread's id, to select its perf samples.
@@ -285,6 +307,7 @@ cd tools
 B=../build-prof/op1emu; IN="--nand ../nand.bin --otp ../otp.bin --cpu 2"
 python3 -m op1prof run    --binary $B $IN                    # one boot: marks, compile/execution split
 python3 -m op1prof verify --binary $B $IN --runs 2           # the workload must repeat exactly
+python3 -m op1prof verify --binary $B $IN --instrumentation  # no instrumentation may change it
 python3 -m op1prof ab     --base-bin old/op1emu --new-bin $B $IN --pairs 4
 python3 -m op1prof ab     --base-bin $B $IN --aa --pairs 4   # noise floor
 python3 -m op1prof extend op1prof-ab-* --pairs 2           # more pairs for the same batch
@@ -317,7 +340,22 @@ and marks files, and the machine state before and after it. `verify
 binds the OTP image, and a different one changes the boot (with a mostly
 empty image the guest re-entered the bootrom early and never reached `lap-begin`).
 A run whose output passes 200 MiB is stopped and failed, before a runaway
-print can fill the disk.
+print can fill the disk. Each run also records the binary's `[build]` line;
+`--trace-events N` (on every command that runs the emulator) sizes the
+trace for a run longer than a stock boot.
+
+`verify --instrumentation` runs the binary once per instrumentation setting:
+marks and trace only, then with the census, the marks file's probes,
+checksums, host counters, and without the trace. Every setting must do the
+same guest work, block for block, and the report names the one that did
+not. Uninitialized memory once made one binary run 1,151,352,850 packets to
+`main-display` without a trace and 851 with one: what a diagnostic run
+showed was then not what a timing run did. Probes are skipped when the marks
+file declares none, counters when `kernel.perf_event_paranoid` is above 2. It refuses
+diagnostic options in `--arg`, which would switch one on in every
+configuration, the plain one included. On a stock boot to `main-display` all six
+settings ran the canonical 346,047,018 blocks and 1,151,352,850 packets,
+with 68,688 interrupts taken and 62,454 latched.
 
 Before starting, op1prof refuses to run when another emulator is running (it
 would compete for CPU and memory, and a second instance cannot bind the USB/IP
@@ -366,6 +404,12 @@ plain `inconclusive` used to hide), `inconclusive`, or one of:
 `workload changed` (the sides did different guest work: no speed verdict
 unless `--allow-workload-change`), `unusable` (a configuration did not
 repeat itself), or `failed` (a run failed; the batch stopped).
+
+`ab` prints both sides' revisions from their `[build]` lines and warns when
+they differ in build type, profiling or compiler: such a comparison measures
+the build settings as well as the change. A profiling build has hooks a
+release build lacks, and `ab` measures only profiling builds; never compare
+one with the other's numbers.
 
 `ab` also compares what the two sides compiled. Each run's distinct (block,
 code hash) pairs are digested; when both sides produced the same digest,
@@ -448,7 +492,7 @@ record the event; it never changes `kernel.perf_event_paranoid` but says what
 to set (2 is enough).
 
 `report` (also printed after `perf`) keeps the CPU thread's samples inside
-the window, drops those inside `translate` spans, and weights the rest by
+the window, drops those inside `translate` and `invalidate` spans, and weights the rest by
 their sample period. It splits the trace's execution CPU in proportion, so
 every table is in seconds of execution CPU:
 
@@ -529,7 +573,8 @@ rule was applied; the tool enforces what it can.
   between capture sets and the baseline 11%. Compare only alternating pairs
   from one session; run `ab --aa` to see the noise floor.
 - **Separate compile from execution by timestamp.** Only the union of
-  `translate` spans is compile time; never add the nested stages.
+  `translate` and `invalidate` spans is compile time; never add the nested
+  stages.
 - **Shares are not savings.** Removing ~20% of sampled FIR work did not move
   display latency; removing a quarter of a block's machine code saved 3.7%;
   deleting a third of the flag stores saved nothing. Census counts are work,
@@ -540,7 +585,7 @@ rule was applied; the tool enforces what it can.
 - **Diagnostics are not free.** A counter set incremented 75M times per boot
   cost 1.4%, enough to swamp a 2% result. Keep census, extra counters and
   perf out of timing runs; compare timing only between equally instrumented
-  builds.
+  builds. Nor may they change the work: `verify --instrumentation` checks.
 - **Check that a knob reached the code.** An optimization level that "made
   no difference" had never reached executed code. If an A/B shows nothing,
   confirm the two sides compiled differently (translation counts, compile

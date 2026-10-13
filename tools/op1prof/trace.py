@@ -1,15 +1,20 @@
-"""The emulator's op1.trace.v2/v3 trace and the metrics derived from it.
+"""The emulator's op1.trace.v2/v3/v4 trace and the metrics derived from it.
 
 v3 adds per-mark process CPU, interrupt entries and, with
 --profile-counters, the CPU thread's user-space instructions and cycles
-(also inside every translate span)."""
+(also inside every translate span). v4 adds `invalidate` spans (bcore's
+cache flush at a boot ROM entry, which rebuilds the JIT), the binary's
+build identity and the recorder's capacity."""
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-SCHEMAS = ("op1.trace.v2", "op1.trace.v3")
+SCHEMAS = ("op1.trace.v2", "op1.trace.v3", "op1.trace.v4")
+# JIT work: compiling a block, and flushing the cache (which destroys the
+# compiled code and builds a new JIT). Everything outside them is execution.
+JIT_SPANS = ("translate", "invalidate")
 
 
 class TraceError(ValueError):
@@ -22,9 +27,11 @@ class Phase:
 
     wall_ms: float          # monotonic time between the marks
     cpu_ms: float           # the CPU thread's CPU time between them
-    compile_wall_ms: float  # union of translate spans inside the window
+    compile_wall_ms: float  # union of JIT spans (translate, invalidate) inside the window
     compile_cpu_ms: float   # CPU time inside those spans
     translations: int = 0   # translate spans inside the window
+    invalidations: int = 0  # invalidate spans inside the window (v4)
+    invalidate_cpu_ms: float = 0.0  # their part of compile_cpu_ms
     process_cpu_ms: Optional[float] = None  # every thread of the process (v3)
     insns: Optional[int] = None             # CPU thread's user-space instructions (--profile-counters)
     compile_insns: Optional[int] = None     # instructions inside translate spans
@@ -61,7 +68,8 @@ class Phase:
         return {"wall_ms": self.wall_ms, "cpu_ms": self.cpu_ms, "offcpu_ms": self.offcpu_ms,
                 "compile_wall_ms": self.compile_wall_ms, "compile_cpu_ms": self.compile_cpu_ms,
                 "noncompile_cpu_ms": self.noncompile_cpu_ms, "noncompile_wall_ms": self.noncompile_wall_ms,
-                "translations": self.translations, "process_cpu_ms": self.process_cpu_ms,
+                "translations": self.translations, "invalidations": self.invalidations,
+                "invalidate_cpu_ms": self.invalidate_cpu_ms, "process_cpu_ms": self.process_cpu_ms,
                 "other_threads_cpu_ms": self.other_threads_cpu_ms, "insns": self.insns,
                 "compile_insns": self.compile_insns, "noncompile_insns": self.noncompile_insns,
                 "host_cycles": self.host_cycles}
@@ -96,6 +104,10 @@ def _union(spans: List[Tuple[float, float]]) -> float:
     return total
 
 
+def jit_spans(trace: dict) -> List[dict]:
+    return [e for e in trace["traceEvents"] if e.get("name") in JIT_SPANS and e.get("ph") == "X"]
+
+
 def phase(trace: dict, begin: str, end: str) -> Phase:
     found = marks(trace)
     for name in (begin, end):
@@ -105,20 +117,23 @@ def phase(trace: dict, begin: str, end: str) -> Phase:
     lo, hi = a["ts"], b["ts"]
     if hi < lo:
         raise TraceError(f"mark {end!r} precedes {begin!r}")
-    spans, compile_cpu_ns, compile_insns = [], 0, 0
+    spans, compile_cpu_ns, compile_insns, translations, invalidations, invalidate_cpu_ns = [], 0, 0, 0, 0, 0
     counted = bool(trace.get("counters"))
-    for event in trace["traceEvents"]:
-        if event.get("name") != "translate" or event.get("ph") != "X":
-            continue
+    for event in jit_spans(trace):
         start, finish = event["ts"], event["ts"] + event["dur"]
         if finish <= lo or start >= hi:
             continue
         if start < lo or finish > hi:
             # Marks fire between blocks and translation happens inside a run,
             # so a straddling span means the trace is not what this expects.
-            raise TraceError(f"translate span at {start} straddles {begin}..{end}")
+            raise TraceError(f"{event['name']} span at {start} straddles {begin}..{end}")
         spans.append((start, finish))
         compile_cpu_ns += event["args"]["cpu_ns"]
+        if event["name"] == "translate":
+            translations += 1
+        else:
+            invalidations += 1
+            invalidate_cpu_ns += event["args"]["cpu_ns"]
         if counted:
             compile_insns += event["args"]["insns"]
     return Phase(
@@ -126,7 +141,9 @@ def phase(trace: dict, begin: str, end: str) -> Phase:
         cpu_ms=(b["args"]["thread_cpu_ns"] - a["args"]["thread_cpu_ns"]) / 1e6,
         compile_wall_ms=_union(spans) / 1e3,
         compile_cpu_ms=compile_cpu_ns / 1e6,
-        translations=len(spans),
+        translations=translations,
+        invalidations=invalidations,
+        invalidate_cpu_ms=invalidate_cpu_ns / 1e6,
         process_cpu_ms=_delta(a, b, "process_cpu_ns", 1e6),
         insns=_delta(a, b, "host_insns") if counted else None,
         compile_insns=compile_insns if counted else None,
