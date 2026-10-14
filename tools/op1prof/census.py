@@ -94,23 +94,29 @@ def edge_report(prefix: Path, begin: str, end: str, limit: int, symbols: Symbols
     return "\n".join(lines)
 
 
-def mmio_first_report(prefix: Path, begin: str, end: str, window: Tuple[int, int], limit: int,
-                      symbols: "Symbols") -> str:
+def mmio_first(prefix: Path, begin: str, end: str, window: Tuple[int, int]) -> List[dict]:
     """MMRs the guest touched for the first time in a phase, in the order it
-    did: which device the phase starts using, and from which block. `window`
-    is the phase in guest cycles (from the marks)."""
+    did, with their accesses in the phase and the block of the first one.
+    `window` is the phase in guest cycles (from the marks)."""
     data = Path(f"{prefix}.mmiofirst.{end}").read_bytes()
     if len(data) % FIRST.size:
         raise ValueError(f"{prefix}.mmiofirst.{end}: truncated ({len(data)} bytes)")
     counts = phase(prefix, "mmio", begin, end)
     lo, hi = window
     rows = sorted((first, addr, pc) for addr, pc, first, _ in FIRST.iter_unpack(data) if lo <= first < hi)
+    return [{"addr": addr, "first_cycles": first, "first_block": pc,
+             "reads": counts.get(addr, (0, 0))[0], "writes": counts.get(addr, (0, 0))[1]}
+            for first, addr, pc in rows]
+
+
+def mmio_first_report(rows: List[dict], begin: str, end: str, limit: int, symbols: "Symbols") -> str:
+    """Which devices a phase starts using, and from which block."""
     lines = [f"MMRs first accessed {begin} -> {end}: {len(rows)} "
              f"(guest time from the start; in deterministic mode, at the accessing block's start)", "",
              f"{'MMR':>10} {'first ms':>10} {'reads':>10} {'writes':>10} {'first block':>11}  symbol"]
-    for first, addr, pc in rows[:limit]:
-        reads, writes = counts.get(addr, (0, 0))
-        lines.append(f"0x{addr:08x} {first / 400e3:10.3f} {reads:>10} {writes:>10} 0x{pc:08x}  {symbols.name(pc)}")
+    for r in rows[:limit]:
+        lines.append(f"0x{r['addr']:08x} {r['first_cycles'] / 400e3:10.3f} {r['reads']:>10} {r['writes']:>10} "
+                     f"0x{r['first_block']:08x}  {symbols.name(r['first_block'])}")
     return "\n".join(lines)
 
 

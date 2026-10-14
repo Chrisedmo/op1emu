@@ -414,6 +414,8 @@ python3 -m op1prof census op1prof-run-*/run --phase main-boot:main-display --edg
 python3 -m op1prof census op1prof-run-*/run --phase main-boot:main-display --exits   # or --memory
 python3 -m op1prof service op1prof-run-*/run --phase main-boot:main-display --capture op1prof-perf-*/capture
 python3 -m op1prof diverge op1prof-run-A/run op1prof-run-B/run   # runs made with --checksum N
+python3 -m op1prof diff census  op1prof-run-A/run op1prof-run-B/run --phase main-boot:main-display
+python3 -m op1prof diff compile op1prof-run-A/run op1prof-run-B/run --phase main-boot:main-display --census op1prof-run-A/run
 python3 -m op1prof perf   --binary $B $IN --window main-boot:main-display
 python3 -m op1prof report op1prof-perf-*/capture --census op1prof-run-*/run --sort ns-per-run
 ```
@@ -502,6 +504,18 @@ plain `inconclusive` used to hide), `inconclusive`, or one of:
 `workload changed` (the sides did different guest work: no speed verdict
 unless `--allow-workload-change`), `unusable` (a configuration did not
 repeat itself), or `failed` (a run failed; the batch stopped).
+
+`ab` also shows where a difference lies, beside the verdict, which they never
+change:
+
+- **Phases**: the execution and compile CPU of every phase between
+  consecutive marks, as the median difference per pair and the mean
+  percentage. A change that speeds up one stage and slows another shows
+  both.
+- **Shape** at the phase end, base against new: blocks executed, packets per
+  block, translations, queue events and cache flushes. Blocks executed
+  changing for the same guest work means the blocks were formed
+  differently.
 
 `ab` prints both sides' revisions from their `[build]` lines and warns when
 they differ in build type, profiling or compiler: such a comparison measures
@@ -595,6 +609,39 @@ classes, and the capture binary's symbol table says which classes define
 the method, so a device is priced by the first of its class and bases that
 does. One whose method cannot be found is shown as `?`, never as a zero. It needs whole call chains (`--call-graph lbr`).
 `--json FILE` writes the report.
+
+### `diff`
+
+`diff census A B --phase BEGIN:END` compares two census runs: total block
+runs, packets and MMR accesses; the first mark at which their guest work
+differs (both runs in firing order: a mark that fired on one side only is a
+difference there too, and a counter one run reports at some marks but not
+at others is one, while a counter a binary lacks everywhere is left out); the blocks that gained or lost the most packets, and those that
+ran on one side only; the MMRs whose accesses changed; and, when both runs
+have them, the service and exit censuses. Blocks that ran a different
+number of times for the same packets were formed differently. With
+`--phase main-boot:main-display` two runs of one binary, before and after
+the fix that left instruction fetches out of the memory census, show the
+same work at every mark and differ only in 832,069,596 against 831,806,301
+guest memory accesses.
+
+`diff compile A B [--phase BEGIN:END] [--census RUNDIR]` compares, per block,
+the versions of its code that could run in the phase: the last translation
+before the phase began, then every one inside it, by code hash. A version
+is distinct code, not a compilation: compiling the same machine code again
+adds none. The same versions in the same order are the same code; one
+version on each side that differs is different code; several versions whose
+sequences differ are *mixed*, since nothing records how much each version
+ran; and a block can be compiled on one side only. IR and machine-code sizes and compile time are
+shown for the last version. With a
+census run it weighs the blocks by the packets they executed in the phase
+and says how much of the work ran code that changed, how much ran unchanged
+code, and how much is unknown (mixed blocks). Both phase marks must be in
+the traces, the first before the second. Where `ab` says only
+whether the compile fingerprints are identical, this says which blocks a
+change reached and how much they ran; it says nothing about speed.
+
+`census`, `compile`, `service` and `diff` take `--json FILE`.
 
 `run` and `verify` take `--checksum N` (records every N blocks) and
 `--checksum-from RUNS`. `diverge A B` reports the first record where two runs

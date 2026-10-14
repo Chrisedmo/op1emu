@@ -14,7 +14,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from . import census, exits, trace
 from .perf import is_software_event
 from .categories import Categories
-from .marks import Mark, parse_marks, workload_diff
+from .marks import Mark, workload_diff
 from .runner import RUN_FILE
 
 SCHEMA = "op1prof.report.v1"

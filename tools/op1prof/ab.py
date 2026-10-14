@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 from dataclasses import asdict, dataclass, fields as dataclass_fields, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -20,7 +21,13 @@ CLEAN_OFFCPU_MS = 1000.0
 # took execution time with it. Four tests per batch, so a strict threshold.
 DRIFT_P = 0.01
 DRIFT_MIN_RUNS = 6
-SCHEMA = "op1prof.ab.v2"
+SCHEMA = "op1prof.ab.v3"
+# Batches extend() can continue: v2 lacks only the per-phase times, which
+# the summary then leaves out.
+EXTENDABLE = ("op1prof.ab.v2", SCHEMA)
+# Shape counters: how the host formed and ran the same work. Reported side by
+# side, never gated.
+SHAPE_FIELDS = ("runs", "translated", "events", "invalidations")
 WORKLOAD_CHANGED = "workload changed: the two sides did different guest work"
 
 
@@ -32,13 +39,16 @@ class Side:
     sha256: str
 
 
-def _metrics(result: RunResult, begin: str, end: str) -> Tuple[dict, Optional[dict]]:
-    """Phase times, and what the whole run compiled (None for a binary that
-    does not report compile shapes)."""
+def _metrics(result: RunResult, begin: str, end: str) -> Tuple[dict, Optional[dict], List[dict]]:
+    """Phase times, what the whole run compiled (None for a binary that does
+    not report compile shapes), and the times of every phase between
+    consecutive marks."""
     trace_data = trace.load(str(result.trace_path))
     spans = compilation.translations(trace_data)
     shape = compilation.codegen(spans) if compilation.has_shape(spans) else None
-    return trace.phase(trace_data, begin, end).to_json(), shape
+    phases = [{"begin": a, "end": b, "noncompile_cpu_ms": p.noncompile_cpu_ms, "compile_cpu_ms": p.compile_cpu_ms}
+              for a, b, p in trace.phases(trace_data)]
+    return trace.phase(trace_data, begin, end).to_json(), shape, phases
 
 
 def _clean(m: dict) -> bool:
@@ -113,13 +123,14 @@ def compare(base: Side, new: Side, spec: RunSpec, pairs: int, out: Path, phase: 
                   "config": _config(base, new, spec, phase, min_effect_pct, allow_workload_change, seed),
                   "runs": [], "pairs": [], "extensions": 0, "status": "running"}
     else:
-        if previous.get("schema") != SCHEMA:
-            raise ValueError(f"the batch was written as {previous.get('schema')!r}, not {SCHEMA}: start a new one")
+        if previous.get("schema") not in EXTENDABLE:
+            raise ValueError(f"the batch was written as {previous.get('schema')!r}, not one of {EXTENDABLE}: "
+                             "start a new one")
         if previous.get("status") not in stats.VERDICTS + (WORKLOAD_CHANGED,):
             raise ValueError(f"the batch ended {previous.get('status')!r}: only a finished batch can be extended; "
                              "start a new one")
-        report = {**previous, "extensions": previous.get("extensions", 0) + 1, "status": "running"}
-        for key in ("summary", "drift", "contended_pairs", "unstable"):
+        report = {**previous, "schema": SCHEMA, "extensions": previous.get("extensions", 0) + 1, "status": "running"}
+        for key in ("summary", "drift", "contended_pairs", "unstable", "phases", "shape"):
             report.pop(key, None)
     path = out / "results.json"
 
@@ -145,7 +156,7 @@ def compare(base: Side, new: Side, spec: RunSpec, pairs: int, out: Path, phase: 
                 report["status"] = f"failed: an input changed during the batch: {changed[0]}"
                 save()
                 return report
-            entry["metrics"], entry["codegen"] = _metrics(result, *phase)
+            entry["metrics"], entry["codegen"], entry["phases"] = _metrics(result, *phase)
             save()
         runs = {e["side"]: e for e in report["runs"] if e["pair"] == index}
         report["pairs"].append({
@@ -213,6 +224,51 @@ def _builds(pairs: List[dict]) -> Optional[dict]:
         return None
     differs = [key for key in BUILD_KIND if builds["base"].get(key) != builds["new"].get(key)]
     return {**builds, "kind_differs": differs}
+
+
+def _phase_deltas(pairs: List[dict], seed: int) -> List[dict]:
+    """Execution and compile CPU of every phase between consecutive marks,
+    base against new over all pairs: where a difference lies. Reported, never
+    a verdict; phases that not every run has are left out."""
+    if not all("phases" in p[side] for p in pairs for side in ("base", "new")):
+        return []
+    def index(entry):
+        return {(x["begin"], x["end"]): x for x in entry["phases"]}
+    first = [(x["begin"], x["end"]) for x in pairs[0]["base"]["phases"]]
+    sides = [(index(p["base"]), index(p["new"])) for p in pairs]
+    out = []
+    for key in first:
+        if not all(key in a and key in b for a, b in sides):
+            continue
+        row = {"begin": key[0], "end": key[1]}
+        for metric in ("noncompile_cpu_ms", "compile_cpu_ms"):
+            base = [a[key][metric] for a, _ in sides]
+            new = [b[key][metric] for _, b in sides]
+            delta_ms = statistics.median(n - b for b, n in zip(base, new))
+            if min(base) > 0:
+                comparison = stats.paired(base, new, seed=seed)
+                row[metric] = {"median_delta_ms": delta_ms, "mean_pct": comparison.mean_pct,
+                               "ci95_pct": [comparison.ci_low_pct, comparison.ci_high_pct]}
+            else:
+                row[metric] = {"median_delta_ms": delta_ms, "mean_pct": None, "ci95_pct": None}
+        out.append(row)
+    return out
+
+
+def _shape(pairs: List[dict], end: str) -> Optional[dict]:
+    """How each side formed and ran the work, at the phase end (the first
+    pair's runs: a configuration repeats it). Blocks executed changing for
+    the same packets means the blocks were formed differently."""
+    out = {}
+    for name in ("base", "new"):
+        marks = {m["name"]: m for m in pairs[0][name]["marks"]}
+        if end not in marks:
+            return None
+        mark = marks[end]
+        out[name] = {k: mark[k] for k in SHAPE_FIELDS if k in mark}
+        if mark.get("runs"):
+            out[name]["packets_per_run"] = mark["packets"] / mark["runs"]
+    return out
 
 
 def _codegen(pairs: List[dict]) -> Optional[dict]:
@@ -292,6 +348,8 @@ def summarize(report: dict, min_effect_pct: float, allow_workload_change: bool, 
     report["summary"] = summary
     report["decided_on"] = decided_on
     report["codegen"] = _codegen(pairs)
+    report["phases"] = _phase_deltas(pairs, seed)
+    report["shape"] = _shape(pairs, report["phase"][1])
     report["builds"] = _builds(pairs)
     report["drift"] = _drift(report)
     report["contended_pairs"] = sum(1 for p in report["pairs"] if p.get("contended"))

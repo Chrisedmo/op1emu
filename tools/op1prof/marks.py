@@ -80,11 +80,15 @@ def optional_absent(*sides: List[Mark]) -> set:
             if any(side and not any(key in m.counters for m in side) for side in sides)}
 
 
-def workload_diff(left: List[Mark], right: List[Mark]) -> List[str]:
-    """Differences in fired marks and their workload, as readable lines."""
+def workload_diff(left: List[Mark], right: List[Mark], skipped: Optional[set] = None) -> List[str]:
+    """Differences in fired marks and their workload, as readable lines.
+    `skipped`, the counters an older binary lacks, defaults to those of
+    these marks; a caller comparing a few marks of longer runs passes the
+    runs' own (optional_absent over all their marks)."""
     problems = []
     left_by, right_by = {m.name: m for m in left}, {m.name: m for m in right}
-    skipped = optional_absent(left, right)
+    if skipped is None:
+        skipped = optional_absent(left, right)
     if [m.name for m in left] != [m.name for m in right]:
         problems.append(f"marks differ: {[m.name for m in left]} vs {[m.name for m in right]}")
     for name in left_by.keys() & right_by.keys():
