@@ -49,6 +49,13 @@ def main(argv=None) -> int:
     p.add_argument("--min-effect", type=float, default=2.0, help="practical threshold in percent")
     p.add_argument("--allow-workload-change", action="store_true",
                    help="report a verdict even though the sides did different guest work")
+    p.add_argument("--perf", type=_positive, metavar="N",
+                   help="after the timing pairs, N perf captures of each side over the phase, alternating, and "
+                        "where their time went (never part of the status)")
+    p.add_argument("--perf-event", default="cycles:u", help="perf event for --perf (default cycles:u)")
+    p.add_argument("--perf-period", type=_positive, default=4000000, help="event count per sample for --perf")
+    p.add_argument("--perf-call-graph", choices=("fp", "lbr"), default="lbr",
+                   help="call stacks for --perf (lbr: whole chains, needs a hardware event)")
     _counters(p)
     _common(p)
     p.set_defaults(func=cmd_ab)
@@ -67,6 +74,8 @@ def main(argv=None) -> int:
     p.add_argument("--period", type=_positive, help="fixed event count per sample (prefer for precise events)")
     p.add_argument("--freq", type=_positive, default=999, help="samples per second when no --period")
     _dump_pc(p)
+    p.add_argument("--captures", type=_positive, default=1,
+                   help="capture N runs and report means and intervals over them (an error estimate needs 3)")
     p.add_argument("--call-graph", choices=("fp", "lbr"), default="fp",
                    help="frame pointers, or Intel LBR call stacks (whole chains through code without frame "
                         "pointers; needs a hardware event)")
@@ -82,7 +91,9 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_annotate)
 
     p = sub.add_parser("report", help="re-report an earlier perf capture directory")
-    p.add_argument("capture", type=Path, help="the capture/ directory of an op1prof perf run")
+    p.add_argument("capture", type=Path, nargs="+",
+                   help="capture/ directories of op1prof perf runs (or a directory holding several): with more "
+                        "than one, means and intervals over them")
     p.add_argument("--top", type=int, default=25)
     p.add_argument("--symbols", type=Path, help="ADDRESS NAME lines to name guest blocks")
     p.add_argument("--pc-range", action="append", default=[], metavar="NAME=LO:HI",
@@ -93,6 +104,9 @@ def main(argv=None) -> int:
                    help="run/ directory of an `op1prof run --census` with the same workload: cost per block run")
     p.add_argument("--sort", choices=("seconds", "ns-per-run", "ns-per-packet"), default="seconds",
                    help="order of the census join")
+    p.add_argument("--min-runs", type=int, default=1000,
+                   help="sorting by ns per run or packet, leave out blocks that ran fewer times (their few "
+                        "samples rank them by chance)")
     p.add_argument("--json", type=Path, help="also write the full report as JSON")
     p.set_defaults(func=cmd_report)
 
@@ -128,9 +142,9 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_service)
 
     p = sub.add_parser("diff", help="two runs side by side: the guest work counted (census) or the code compiled")
-    p.add_argument("what", choices=("census", "compile"))
-    p.add_argument("a", type=Path, help="run directory A (the base)")
-    p.add_argument("b", type=Path, help="run directory B")
+    p.add_argument("what", choices=("census", "compile", "report"))
+    p.add_argument("a", type=Path, help="run directory A (the base); for report, captures (one, or a directory of them)")
+    p.add_argument("b", type=Path, help="run directory B; for report, captures")
     p.add_argument("--phase", help="BEGIN:END (required for census; compile defaults to the whole run)")
     p.add_argument("--census", type=Path, metavar="RUNDIR",
                    help="compile: weigh blocks by the packets this census run executed in the phase")

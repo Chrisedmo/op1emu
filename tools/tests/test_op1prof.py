@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from op1prof import ab, census, cli, compilation, diff, exits, machine, service, stats, trace, verify  # noqa: E402
+from op1prof import ab, capture_set, census, cli, compilation, diff, exits, machine, service, stats, trace, verify  # noqa: E402
 from op1prof.marks import parse_mark, workload_diff, parse_marks  # noqa: E402
 from op1prof.runner import RESERVED_ARGS, RunSpec, run, snapshot_binary, sha256_file  # noqa: E402
 
@@ -1751,3 +1751,172 @@ def test_first_difference_judges_a_missing_counter_over_the_whole_runs():
     older = [mark("a", ""), mark("b", "")]
     assert diff.first_difference(older, [mark("a", ""), mark("b", "")]) is None
     assert diff.first_difference([mark("a", " irq=0"), mark("b", " irq=1")], older) is None
+
+
+# ---- capture sets, perf diff, lost samples ----
+
+def _report(seconds, rtc, fir_self, window=("a", "b"), lost=None):
+    """A perf report as report.analyze() returns it, with the parts capture_set reads."""
+    return {"window": list(window), "event": "cycles:u", "rate": ["-c", "4000000"], "call_graph": "lbr",
+            "execution_cpu_s": seconds, "inclusive_valid": True, "record": lost,
+            "samples": {"execution": {"count": 100, "weight": 100}},
+            "buckets": [{"bucket": "rtc", "seconds": rtc}, {"bucket": "dma", "seconds": 1.0}],
+            "blocks": [{"block": "bb_0x01a5e27e", "self_s": fir_self, "incl_s": fir_self * 4}],
+            "host_self": [{"symbol": "RTC::Tick()", "seconds": rtc / 2}],
+            "host_inclusive": [{"symbol": "RTC::ProcessWithInterrupt(int)", "seconds": rtc}]}
+
+
+def test_a_capture_set_reports_means_and_intervals_from_three_captures():
+    reports = [_report(10.0, 2.0, 1.0), _report(10.2, 2.2, 1.1), _report(9.8, 1.8, 0.9)]
+    data = capture_set.aggregate([Path("c0"), Path("c1"), Path("c2")], reports)
+    rtc = {r["bucket"]: r for r in data["buckets"]}["rtc"]
+    assert rtc["mean"] == pytest.approx(2.0) and rtc["values"] == [2.0, 2.2, 1.8]
+    half = stats.t975(2) * 0.2 / 3 ** 0.5
+    assert rtc["ci95"] == pytest.approx([2.0 - half, 2.0 + half])
+    incl = {r["block"]: r for r in data["blocks_incl"]}["bb_0x01a5e27e"]
+    assert incl["mean"] == pytest.approx(4.0)
+    assert "95% t interval" in capture_set.format_set(data, 5)
+    two = capture_set.aggregate([Path("c0"), Path("c1")], reports[:2])
+    assert all(r["ci95"] is None for r in two["buckets"])
+    assert "an interval needs 3 or more" in capture_set.format_set(two, 5)
+
+
+def test_a_perf_diff_gives_welch_intervals_only_with_enough_captures():
+    a = [_report(10.0, 2.0, 1.0), _report(10.0, 2.1, 1.0), _report(10.0, 1.9, 1.0)]
+    b = [_report(9.0, 1.0, 1.0), _report(9.0, 1.1, 1.0), _report(9.0, 0.9, 1.0)]
+    caps = [Path(f"a{i}") for i in range(3)]
+    other = [Path(f"b{i}") for i in range(3)]
+    data = _diff_sets(caps, a, other, b)
+    rtc = {r["bucket"]: r for r in data["buckets"]}["rtc"]
+    assert rtc["delta"] == pytest.approx(-1.0) and rtc["ci95"][1] < 0
+    dma = {r["bucket"]: r for r in data["buckets"]}["dma"]
+    assert dma["ci95"] == [0.0, 0.0]
+    assert "95% Welch interval" in capture_set.format_diff(data, 5)
+    single = _diff_sets(caps[:1], a[:1], other[:1], b[:1])
+    assert all(r["ci95"] is None for r in single["buckets"])
+    assert "a single capture's difference is not evidence" in capture_set.format_diff(single, 5)
+    with pytest.raises(ValueError, match="window"):
+        _diff_sets(caps, a, other, [_report(9.0, 1.0, 1.0, window=("a", "c"))] * 3)
+    with pytest.raises(ValueError, match="both sides"):
+        _diff_sets(caps, a, caps, b)
+
+
+def _diff_sets(ca, a, cb, b, monkeypatch=None):
+    # diff_sets reads each set's run marks for the workload check: give it equal ones.
+    from unittest import mock
+    with mock.patch.object(perf_report, "_run_entry", lambda path: {"marks": [_mark_entry("b", 10)]}):
+        return capture_set.diff_sets(ca, a, cb, b)
+
+
+def test_captures_under_a_set_directory_and_the_same_run_check(tmp_path, monkeypatch):
+    for i in range(2):
+        (tmp_path / "set" / f"capture{i:02d}").mkdir(parents=True)
+        (tmp_path / "set" / f"capture{i:02d}" / "capture.json").write_text("{}")
+    assert [p.name for p in capture_set.captures_under(tmp_path / "set")] == ["capture00", "capture01"]
+    assert capture_set.captures_under(tmp_path / "set" / "capture01") == [tmp_path / "set" / "capture01"]
+    with pytest.raises(ValueError, match="no capture"):
+        capture_set.captures_under(tmp_path)
+    reports = iter([_report(10.0, 2.0, 1.0), _report(10.0, 2.0, 1.0, window=("a", "c"))])
+    monkeypatch.setattr(perf_report, "analyze", lambda *a, **k: next(reports))
+    with pytest.raises(ValueError, match="window"):
+        capture_set.load(capture_set.captures_under(tmp_path / "set"), Categories.load(), perf_report.Labels())
+    checked = []
+    monkeypatch.setattr(perf_report, "analyze", lambda *a, **k: _report(10.0, 2.0, 1.0))
+    monkeypatch.setattr(perf_report, "check_same_run", lambda a, b: checked.append((a.name, b.parent.name)))
+    capture_set.load(capture_set.captures_under(tmp_path / "set"), Categories.load(), perf_report.Labels())
+    assert checked == [("capture00", "capture01")]
+
+
+def test_lost_samples_are_counted_from_the_records_not_the_record_count():
+    stats_out = ["           TOTAL events:      34521", "          SAMPLE events:      28982  (84.0%)",
+                 "            LOST events:          3  ( 0.0%)", "    LOST_SAMPLES events:          2  ( 0.0%)"]
+    # As perf report -D prints them: three overflows of 2, 16 and 128 samples,
+    # then per-event summaries of the same 146.
+    dump = ["2514044432043386 0x5e080 [0x30]: PERF_RECORD_LOST: id:4026: lost:2",
+            "2514045191034226 0xd35e0 [0x30]: PERF_RECORD_LOST: id:4032: lost:16",
+            "2514045341026017 0xe7f58 [0x30]: PERF_RECORD_LOST: id:4032: lost:128",
+            "0 0x15ef08 [0x28]: PERF_RECORD_LOST_SAMPLES: id:4026: lost samples :2",
+            "0 0x15ef30 [0x28]: PERF_RECORD_LOST_SAMPLES: id:4032: lost samples :144",
+            "2514044432043999 0x5e0b0 [0x18]: PERF_RECORD_THROTTLE: unhandled!"]
+    found = perf.parse_record_stats(stats_out, dump)
+    assert found["samples"] == 28982 and found["lost"] == 146 and found["throttle"] == 1
+    assert "throttled the sampling 1 times" in found["warning"]
+    # Without summaries the overflows are the count: the review's case, one
+    # record of 261 lost against 519 samples.
+    one = perf.parse_record_stats(["SAMPLE events: 519", "LOST events: 1"], ["x: PERF_RECORD_LOST: id:1: lost:261"])
+    assert one["lost"] == 261 and "261 of 780 samples lost" in one["warning"]
+    clean = perf.parse_record_stats(["SAMPLE events: 10"], [])
+    assert clean == {"samples": 10, "lost": 0, "throttle": 0, "warning": None}
+
+
+def test_host_symbols_keep_their_name_across_binaries_and_jit_dumps():
+    assert perf_report.dso_label("op1emu-0123456789ab") == perf_report.dso_label("op1emu-ba9876543210") == "op1emu"
+    assert perf_report.dso_label("jitted-4123-7.so") == perf_report.dso_label("jitted-99-12.so") == "jitted"
+    assert perf_report.dso_label("libc.so.6") == "libc.so.6"
+    # Two binaries' captures: the same function is one row, not a loss and a gain.
+    def report(dso):
+        r = _report(10.0, 2.0, 1.0)
+        r["host_self"] = [{"symbol": f"RTC::Tick() ({perf_report.dso_label(dso)})", "seconds": 10.0}]
+        return r
+    data = _diff_sets([Path(f"a{i}") for i in range(3)], [report("op1emu-0123456789ab")] * 3,
+                      [Path(f"b{i}") for i in range(3)], [report("op1emu-ba9876543210")] * 3)
+    assert [(r["symbol"], r["delta"]) for r in data["host_self"]] == [("RTC::Tick() (op1emu)", 0.0)]
+
+
+def test_a_capture_set_refuses_empty_and_repeated_captures(tmp_path, monkeypatch):
+    for i in range(2):
+        (tmp_path / f"c{i}").mkdir()
+        (tmp_path / f"c{i}" / "capture.json").write_text("{}")
+    monkeypatch.setattr(perf_report, "check_same_run", lambda a, b: None)
+    empty = {**_report(10.0, 2.0, 1.0), "samples": {"execution": {"count": 0, "weight": 0}}}
+    reports = iter([_report(10.0, 2.0, 1.0), empty])
+    monkeypatch.setattr(perf_report, "analyze", lambda *a, **k: next(reports))
+    with pytest.raises(ValueError, match="no execution samples"):
+        capture_set.load([tmp_path / "c0", tmp_path / "c1"], Categories.load(), perf_report.Labels())
+    monkeypatch.setattr(perf_report, "analyze", lambda *a, **k: _report(10.0, 2.0, 1.0))
+    with pytest.raises(ValueError, match="given twice"):
+        capture_set.load([tmp_path / "c0", tmp_path / "c0", tmp_path / "c0"], Categories.load(), perf_report.Labels())
+    with pytest.raises(ValueError, match="given twice"):     # a capture and its parent directory
+        capture_set.load(capture_set.captures_under(tmp_path) + [tmp_path / "c1"], Categories.load(),
+                         perf_report.Labels())
+
+
+def test_ns_per_run_order_leaves_out_rarely_run_blocks():
+    joined = {"runs": 1100, "outside_blocks_s": 0.0, "outside_blocks_ns_per_run": 0.0, "sampled_not_in_census_s": 0.0,
+              "blocks": [{"block": "rare", "runs": 3, "packets": 3, "seconds": 0.001, "ns_per_run": 333333.0,
+                          "ns_per_packet": 333333.0},
+                         {"block": "hot", "runs": 1097, "packets": 5000, "seconds": 0.002, "ns_per_run": 1823.0,
+                          "ns_per_packet": 400.0}]}
+    lines = "\n".join(perf_report._census_lines(joined, 5, "ns-per-run"))
+    assert "1 blocks that ran fewer than 1000 times are left out" in lines and "rare" not in lines
+    assert "rare" in "\n".join(perf_report._census_lines(joined, 5, "seconds"))
+    assert "rare" in "\n".join(perf_report._census_lines(joined, 5, "ns-per-run", min_runs=1))
+
+
+def test_ab_perf_captures_both_sides_alternately_after_the_pairs(files, tmp_path, monkeypatch, capsys):
+    recorded = []
+    def fake_record(spec, directory, window, event, period, freq, call_graph):
+        recorded.append((directory.parent.name, directory.name, event, call_graph))
+        result = run(spec, directory / "run")
+        (directory / "capture.json").write_text("{}")
+        return result
+    monkeypatch.setattr(perf, "record", fake_record)
+    monkeypatch.setattr(perf, "preflight", lambda *a: None)
+    monkeypatch.setattr(perf_report, "analyze", lambda *a, **k: _report(10.0, 2.0, 1.0, window=("start", "main-frame")))
+    monkeypatch.setattr(perf_report, "check_same_run", lambda a, b: None)
+    assert cli.main(["ab", "--base-bin", str(FAKE), "--nand", str(files / "nand.bin"), "--otp", str(files / "otp.bin"),
+                     "--marks", str(files / "marks.json"), "--force", "--out", str(tmp_path / "ab"), "--aa",
+                     "--timeout", "30", "--progress-timeout", "5", "--perf", "2"]) in (0, 1)
+    assert [(side, name) for side, name, _, _ in recorded] == [("base", "capture00"), ("new", "capture00"),
+                                                                ("new", "capture01"), ("base", "capture01")]
+    assert recorded[0][2:] == ("cycles:u", "lbr")
+    assert "where the time went, 2 perf captures a side" in capsys.readouterr().out
+    assert json.loads((tmp_path / "ab" / "perf" / "diff.json").read_text())["schema"] == capture_set.DIFF_SCHEMA
+
+
+def test_ab_perf_checks_perf_before_the_timing_runs(files, tmp_path, monkeypatch):
+    monkeypatch.setattr(perf, "preflight", lambda *a: "perf may not record: set kernel.perf_event_paranoid=2")
+    with pytest.raises(SystemExit, match="--perf: perf may not record"):
+        cli.main(["ab", "--base-bin", str(FAKE), "--nand", str(files / "nand.bin"), "--otp", str(files / "otp.bin"),
+                  "--marks", str(files / "marks.json"), "--force", "--out", str(tmp_path / "ab"), "--aa", "--perf", "3"])
+    assert not (tmp_path / "ab").exists()

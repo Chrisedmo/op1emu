@@ -6,7 +6,7 @@ import sys
 from typing import List
 from pathlib import Path
 
-from .. import census, compilation, diff, diverge, exits, perf, probes, service, trace
+from .. import capture_set, census, compilation, diff, diverge, exits, perf, probes, service, trace
 from .. import report as perf_report
 from ..categories import Categories
 from .. import marks as marks_file
@@ -31,16 +31,23 @@ def cmd_perf(args) -> int:
     if not _preflight(args):
         return 2
     out = _out(args, "perf")
-    result = perf.record(_spec(args, snapshot_binary(args.binary, out)), out / "capture", (begin, end),
-                         args.event, args.period, args.freq, args.call_graph)
-    error = result.error if not result.reached else \
-        perf.check_fired(args.marks, (begin, end), [m.name for m in result.marks])
-    if error:
-        print(f"capture failed: {error} (log: {result.directory / 'log.txt'})", file=sys.stderr)
-        return 1
+    spec = _spec(args, snapshot_binary(args.binary, out))
+    # One capture keeps its old place; several are numbered, one run each.
+    captures = [out / "capture"] if args.captures == 1 else [out / f"capture{i:02d}" for i in range(args.captures)]
+    for capture in captures:
+        result = perf.record(spec, capture, (begin, end), args.event, args.period, args.freq, args.call_graph)
+        error = result.error if not result.reached else \
+            perf.check_fired(args.marks, (begin, end), [m.name for m in result.marks])
+        if error:
+            print(f"capture failed: {error} (log: {result.directory / 'log.txt'})", file=sys.stderr)
+            return 1
     try:
-        print(perf_report.format_report(perf_report.analyze(out / "capture", Categories.load(),
-                                                            perf_report.Labels()), args.top))
+        if len(captures) == 1:
+            print(perf_report.format_report(perf_report.analyze(captures[0], Categories.load(),
+                                                                perf_report.Labels()), args.top))
+        else:
+            reports = capture_set.load(captures, Categories.load(), perf_report.Labels())
+            print(capture_set.format_set(capture_set.aggregate(captures, reports), args.top))
     except REPORT_ERRORS as error:
         print(f"report: {error}", file=sys.stderr)
         return 1
@@ -59,13 +66,23 @@ def cmd_annotate(args) -> int:
 def cmd_report(args) -> int:
     try:
         labels = perf_report.Labels(census.Symbols(args.symbols), [perf_report.PcRange.parse(r) for r in args.pc_range])
-        data = perf_report.analyze(args.capture, Categories.load(args.categories), labels, args.callers, args.census)
+        captures = [c for path in args.capture for c in capture_set.captures_under(path)]
+        if len(captures) > 1:
+            if args.census or args.callers:
+                raise ValueError("--census and --callers report one capture; give one")
+            reports = capture_set.load(captures, Categories.load(args.categories), labels)
+            data = capture_set.aggregate(captures, reports)
+            text = capture_set.format_set(data, args.top)
+        else:
+            data = perf_report.analyze(captures[0], Categories.load(args.categories), labels, args.callers,
+                                       args.census)
+            text = perf_report.format_report(data, args.top, args.sort, args.min_runs)
     except REPORT_ERRORS as error:
         print(f"report: {error}", file=sys.stderr)
         return 2
     if args.json:
         args.json.write_text(json.dumps(data, indent=1) + "\n")
-    print(perf_report.format_report(data, args.top, args.sort))
+    print(text)
     return 0
 
 
@@ -179,7 +196,13 @@ def cmd_census(args) -> int:
 def cmd_diff(args) -> int:
     symbols = census.Symbols(args.symbols)
     try:
-        if args.what == "census":
+        if args.what == "report":
+            a, b = capture_set.captures_under(args.a), capture_set.captures_under(args.b)
+            categories, labels = Categories.load(), perf_report.Labels(symbols)
+            data = capture_set.diff_sets(a, capture_set.load(a, categories, labels),
+                                         b, capture_set.load(b, categories, labels))
+            print(capture_set.format_diff(data, args.top))
+        elif args.what == "census":
             if not args.phase:
                 raise ValueError("diff census needs --phase BEGIN:END")
             data = diff.census_diff(args.a, args.b, *marks_file.parse_phase(args.phase))
@@ -188,7 +211,7 @@ def cmd_diff(args) -> int:
             window = marks_file.parse_phase(args.phase) if args.phase else None
             data = diff.compile_diff(args.a, args.b, window, args.census)
             print(diff.compile_report(data, args.top, symbols))
-    except (OSError, ValueError, KeyError) as error:
+    except REPORT_ERRORS as error:
         print(f"diff: {error}", file=sys.stderr)
         return 2
     if args.json:

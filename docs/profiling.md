@@ -663,7 +663,44 @@ window end, is rejected rather than recorded empty, and a capture fails if
 its window marks did not both fire or the marks fired out of file order),
 then `perf inject --jit`. It checks first that perf may
 record the event; it never changes `kernel.perf_event_paranoid` but says what
-to set (2 is enough).
+to set (2 is enough). Every capture records perf's own counts of samples,
+lost samples and throttling in `capture.json` (samples from `perf report
+--stats`; lost samples and throttling from the records in `perf report -D`,
+since `--stats` counts records and one record can stand for hundreds of
+lost samples; reading them takes about 17 s for a boot's 200k samples), and
+`report` warns when more than 1% of the sample records were lost or perf
+throttled the rate: the tables then under-sample those stretches. For older
+captures it reads them from `perf.data`.
+
+`perf --captures N` records N runs (`capture00`, ...) of the same
+configuration, and `report` with several captures (or a directory holding
+them) gives every bucket, block and host symbol as a mean over them with a
+95% t interval from three captures on. One configuration's shares moved by
+2.5% between capture sets in the research line and a baseline's by 11%,
+tenfold what Poisson noise on the sample counts suggests: the interval
+comes from the captures, never from sample counts. The captures must be
+one run in all but timing (the same check as `report --census`), each
+given once (a capture listed twice, or with its parent directory, would
+narrow the interval for nothing), and each with execution samples in its
+window: a window too short for the sampling period has none, and its rows
+would read as zero time rather than unknown.
+
+`diff report A B` compares two sets (each a capture or a directory of them)
+of the same window and event, no capture on both sides: per bucket, block
+and symbol (the binary snapshot and the jitted code are one DSO name in
+every capture, so a function of two binaries is one row), the mean
+seconds of each, their difference and, with three or more captures a side,
+a 95% Welch interval of it. It says where the time went differently, not
+whether the total changed (that is `ab`'s verdict). `ab --perf N` takes N
+captures of each side over its phase after the timing pairs, in alternating
+order, under `perf/base` and `perf/new`, and prints their `diff report`;
+they never enter the status, since sampling changes timing. perf's
+permission for `--perf-event` (default `cycles:u` with LBR stacks) is
+checked before the timing runs. Every row is a test of its own, so across
+hundreds of rows some intervals exclude 0 by chance: in an A/A of three
+captures a side (`start` to `main-boot`), 10 of 689 did, and the report
+prints how many of its own do. Trust a difference that is large or that a
+second set repeats.
 
 `report` (also printed after `perf`) keeps the CPU thread's samples inside
 the window, drops those inside `translate` and `invalidate` spans, and weights the rest by
@@ -719,7 +756,9 @@ script, the same
 guest work, and the same
 number of blocks at every mark, since the census's block counts divide the
 samples and the workload gate deliberately ignores them. `--sort ns-per-run` ranks blocks by how
-expensive one execution is rather than by total share. These are sampled
+expensive one execution is rather than by total share; those orders leave
+out blocks that ran fewer than `--min-runs` times (default 1000), whose few
+samples would rank them by chance. These are sampled
 estimates: their error comes from repeating captures, not from sample counts.
 `--json FILE` writes the whole report for further analysis, and
 `--categories FILE` replaces `profiling/categories.json`. A trace that does
@@ -759,7 +798,8 @@ rule was applied; the tool enforces what it can.
 - **Error bars come from paired repeats.** Poisson noise on sample counts
   understated the real spread about tenfold: one configuration varied 2.5%
   between capture sets and the baseline 11%. Compare only alternating pairs
-  from one session; run `ab --aa` to see the noise floor.
+  from one session; run `ab --aa` to see the noise floor. For where the time
+  went, take three or more captures a side (`perf --captures`, `ab --perf`).
 - **Separate compile from execution by timestamp.** Only the union of
   `translate` and `invalidate` spans is compile time; never add the nested
   stages.

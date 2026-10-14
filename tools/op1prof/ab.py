@@ -171,6 +171,27 @@ def compare(base: Side, new: Side, spec: RunSpec, pairs: int, out: Path, phase: 
     return report
 
 
+def perf_captures(base: Side, new: Side, spec: RunSpec, out: Path, phase: tuple, count: int, event: str,
+                  period: Optional[int], call_graph: str) -> Tuple[List[Path], List[Path]]:
+    """`count` perf captures of each side over the phase, in alternating
+    order like the timing pairs, under out/perf/{base,new}/. They are kept
+    out of the verdict: sampling changes timing."""
+    from . import perf
+    captures: dict = {"base": [], "new": []}
+    for index in range(count):
+        for side in ((base, new) if index % 2 == 0 else (new, base)):
+            directory = out / "perf" / side.name / f"capture{index:02d}"
+            directory.parent.mkdir(parents=True, exist_ok=True)
+            side_spec = replace(spec, binary=side.binary, args=spec.args + side.args)
+            result = perf.record(side_spec, directory, phase, event, period, None, call_graph)
+            error = result.error if not result.reached else perf.check_fired(spec.marks, phase,
+                                                                           [m.name for m in result.marks])
+            if error:
+                raise RuntimeError(f"perf capture {index} of {side.name} failed: {error}")
+            captures[side.name].append(directory)
+    return captures["base"], captures["new"]
+
+
 def _drift(report: dict) -> List[str]:
     """Trends with the run order: the machine, not the change, moving."""
     found = []

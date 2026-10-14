@@ -5,9 +5,11 @@ import json
 import sys
 from pathlib import Path
 
-from .. import ab, stats, trace, verify
+from .. import ab, capture_set, perf, stats, trace, verify
+from .. import report as perf_report
+from ..categories import Categories
 from ..runner import instrument_args, run, sha256_file, snapshot_binary
-from .common import OTHER_THREADS_WARN, _check_args, _check_timing_args, _out, _phase, _preflight, _spec
+from .common import OTHER_THREADS_WARN, REPORT_ERRORS, _check_args, _check_timing_args, _out, _phase, _preflight, _spec
 
 
 def cmd_run(args) -> int:
@@ -109,6 +111,13 @@ def _verify_instrumentation(args) -> int:
 def cmd_ab(args) -> int:
     _check_timing_args(args.arg + args.base_arg + args.new_arg)
     phase = _phase(args)
+    if args.perf:
+        # Before the timing runs: finding out afterwards costs the batch.
+        problem = perf.check_window(args.marks, phase, args.until) or \
+            perf.check_call_graph(args.perf_event, args.perf_call_graph) or \
+            perf.preflight(args.perf_event, ["-c", str(args.perf_period)], args.perf_call_graph)
+        if problem:
+            raise SystemExit(f"--perf: {problem}")
     if not _preflight(args, compares=True):
         return 2
     out = _out(args, "ab")
@@ -121,12 +130,27 @@ def cmd_ab(args) -> int:
     base = ab.Side("base", snapshot_binary(args.base_bin, out), list(args.base_arg), sha256_file(args.base_bin))
     new = ab.Side("new", snapshot_binary(new_binary, out), list(args.new_arg if not args.aa else args.base_arg),
                   sha256_file(new_binary))
+    spec = _spec(args, base.binary)
     try:
-        report = ab.compare(base, new, _spec(args, base.binary), args.pairs, out, phase,
-                            args.min_effect, args.allow_workload_change)
+        report = ab.compare(base, new, spec, args.pairs, out, phase, args.min_effect, args.allow_workload_change)
     except ValueError as error:
         raise SystemExit(str(error))
-    return _print_ab(report, out)
+    status = _print_ab(report, out)
+    if args.perf and report["status"] in stats.VERDICTS + (ab.WORKLOAD_CHANGED,):
+        try:
+            a, b = ab.perf_captures(base, new, spec, out, phase, args.perf, args.perf_event, args.perf_period,
+                                    args.perf_call_graph)
+            categories, labels = Categories.load(), perf_report.Labels()
+            data = capture_set.diff_sets(a, capture_set.load(a, categories, labels),
+                                         b, capture_set.load(b, categories, labels))
+        except REPORT_ERRORS as error:
+            print(f"--perf: {error}", file=sys.stderr)
+            return 1
+        (out / "perf" / "diff.json").write_text(json.dumps(data, indent=1) + "\n")
+        print(f"\nwhere the time went, {args.perf} perf captures a side (not part of the status; "
+              f"op1prof diff report {out / 'perf' / 'base'} {out / 'perf' / 'new'} repeats it):")
+        print(capture_set.format_diff(data, 15))
+    return status
 
 
 def cmd_extend(args) -> int:
