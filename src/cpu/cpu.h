@@ -42,7 +42,7 @@ class SPORT;
 class AudioOutput;
 class Profiler;
 struct BcoreStats;
-namespace profiling { struct ServiceStats; }
+namespace profiling { struct ServiceStats; struct MemoryCensus; }
 class BcoreEventSink;
 
 class BlackFinCpu : public CpuInterface {
@@ -95,6 +95,8 @@ public:
     // publishes interrupt levels through the CPU's USB device at any time,
     // so the counts live exactly as long as what it calls into.
     profiling::ServiceStats& EnableServiceStats();
+    // Count guest memory accesses by device (census runs); owned like the service counts.
+    profiling::MemoryCensus& EnableMemoryCensus();
     const CpuState& State() const { return *cpuState_; }
 #endif
     // Deterministic mode only: RTC calendar time at guest time zero.
@@ -135,6 +137,7 @@ protected:
     uint64_t eventsDelivered_ = 0;
     std::array<uint64_t, 16> irqLatched_{};
     std::unique_ptr<profiling::ServiceStats> serviceStats_;
+    std::unique_ptr<profiling::MemoryCensus> memoryCensus_;
     std::atomic<profiling::ServiceStats*> service_{nullptr};
     profiling::ServiceStats* Service() const { return service_.load(std::memory_order_acquire); }
 #endif

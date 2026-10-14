@@ -1,8 +1,12 @@
 #include "cpu/cpu.h"
 #include "cpu/twi.h"
 #include "cpu/usb.h"
+#include "peripheral/MT29F4G08.h"
+#include "profiling/memory_census.h"
 #include "profiling/profiler.h"
 #include "profiling/service_stats.h"
+#include "bcore_profile.h"
+#include "cpu_state.h"
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -73,6 +77,44 @@ int main() {
         });
         usbip.join();
         Require(stats->publishedOtherThreads > before, "another thread's publications still land in live counts");
+    }
+    {
+        // bcore fetches a block's instructions through the host memory as it
+        // translates it: those reads are compilation, not guest accesses, so
+        // the census counts the same for a cold block, a cached one and one
+        // recompiled after the cache flush at the boot ROM entry.
+        BlackFinCpu cpu(true);
+        // Run() services the NFC, which needs a flash: an erased one, read-only.
+        cpu.AttachNandFlash(std::make_shared<MT29F4G08>(cpu, "service-stats-test.nand", true));
+        auto& emulator = cpu.GetEmulator();
+        auto code = [&](u32 at, std::initializer_list<u16> words) {
+            for (u16 word : words) { emulator.MemoryWrite16(at, word); at += 2; }
+        };
+        code(0xFFA00000, {0x0000, 0x0000, 0x2FFE});  // NOP; NOP; JUMP.S back (the flush entry)
+        code(0xFFA00100, {0x0000, 0x0000, 0x2FFE});  // NOP; NOP; JUMP.S back: no data access
+        code(0xFFA00200, {0x9100, 0x2FFF});          // R0 = [P0]; JUMP.S back: one load
+        ProfilerOptions options;
+        options.censusPrefix = "service-stats-test";
+        Profiler profiler(options, cpu, [] {});
+        cpu.SetProfiler(&profiler);  // as main() does: the hooks and the event sink
+        auto& memory = cpu.EnableMemoryCensus();
+        auto run = [&](u32 pc) { cpu.SetPC(pc); cpu.Run(); };
+        const uint64_t translated = cpu.CoreStats().blocks_translated;
+        run(0xFFA00100);
+        Require(cpu.CoreStats().blocks_translated == translated + 1 && memory.accesses == 0,
+                "a cold translation's instruction fetches are not guest accesses");
+        run(0xFFA00100);
+        Require(memory.accesses == 0, "nor are a cached block's");
+        run(0xFFA00200);
+        Require(memory.accesses == 1, "a load counts once, on its cold run");
+        run(0xFFA00200);
+        Require(memory.accesses == 2, "and once on its cached run");
+        run(0xFFA00000);  // the boot ROM entry flushes the cache
+        run(0xFFA00200);
+        Require(cpu.CoreStats().blocks_translated == translated + 4 && memory.accesses == 3,
+                "a block recompiled after the flush counts its load once");
+        Require(!memory.paused, "counting resumes after every translation");
+        cpu.SetProfiler(nullptr);
     }
     std::puts("ServiceStats tests passed");
 }

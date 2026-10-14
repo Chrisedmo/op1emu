@@ -157,7 +157,14 @@ microseconds, the clock `perf record -k mono` uses.
   (after the IR pipeline), `object_bytes` of machine code, and
   `object_hash`, a hex string hashing that code before relocation together
   with its relocations and, transitively, the constant pools, jump tables
-  and function-pointer tables they point into with their own relocations. The same code has the same hash in every process, wherever the JIT
+  and function-pointer tables they point into with their own relocations.
+  `terminator` names where decoding ended the block (bcore's
+  `BcoreCompileMetrics::terminator`): `jump`, `call`, `return`,
+  `return-from-event`, `jump-indirect`, `call-indirect`, `loop-setup`,
+  `raise`, `exception`, `halt`, `illegal`, `unimplemented`, or `packet-cap`
+  at the 256-packet block limit. A conditional branch never ends a block.
+  It is a static label of the block, not of each run: a run can leave
+  earlier, through a taken branch, a hardware loop or an exception. The same code has the same hash in every process, wherever the JIT
   placed it (bcore's fastmem and rawmem paths would embed a host address and
   break that; op1emu uses neither). `collect_ns` is the time spent collecting
   these metrics, included in the span's `cpu_ns`: about 0.09% of compile
@@ -178,7 +185,7 @@ makes the emulator exit nonzero. Do not use it. A trace recorded without
 
 `--profile-census PREFIX` writes `PREFIX.pc.MARK`, `PREFIX.mmio.MARK`,
 `PREFIX.mmiofirst.MARK` and `PREFIX.edge.MARK` at every mark, sorted little-endian records with
-cumulative counts, and `PREFIX.service.MARK` (below):
+cumulative counts, and `PREFIX.service.MARK`, `PREFIX.exit.MARK` and `PREFIX.memory.MARK` (below):
 
 - `pc` (`u32 key, u64, u64`): block entry PC, runs, packets executed from that entry.
 - `mmio` (`u32 key, u64, u64`): MMR address, guest reads, guest writes.
@@ -194,6 +201,36 @@ cumulative counts, and `PREFIX.service.MARK` (below):
 Difference two marks' files for one phase. The census costs hash-map updates
 per block and per MMR access: it changes timing, so never combine it with a
 timing measurement. The counts themselves do not depend on it.
+
+### Exit and memory census
+
+op1emu returns to the host after every block. `PREFIX.exit.MARK` says after
+which of those runs the host was needed, per block, as little-endian
+records (`u32 block, u32 0, u64 mmio, u64 host, u64 both, u64 accesses`):
+runs in which the block accessed an MMR (it called into a device), runs
+after which the host did something the guest can see (a productive device
+call, an event other than a raise, a new ILAT bit, a GP timer tick, or the
+CEC entering or leaving an interrupt, all up to the next block's start),
+runs with both, and the block's guest memory accesses. The rest of the
+block's runs (from the PC census) needed nothing. As with edges, a run
+counts in the phase of the block it ends.
+
+`PREFIX.memory.MARK` (JSON, `op1.memory.v1`) counts the guest's loads and
+stores by device and width (8, 16, 32 bits), found the way the emulator
+finds the device, with `unmapped` for addresses no device maps. Every one
+of them is a call from generated code into the host in op1emu. bcore reads
+a block's instructions through the same interface while it translates the
+block; those reads are compilation, once per translation, and the census
+leaves them out (a stock boot's 21,631 translations fetched 263,295 times).
+
+On a stock boot between `main-boot` and `main-display`, 338,146,940 of
+340,049,495 block runs (99.4%) needed nothing from the host: 1,640,665 had
+accessed an MMR, 197,166 were followed by host work the guest could see,
+64,724 both. 266M of the runs end in a jump and 99.8% of those needed
+nothing; the FIR loop block 0x01a5e27e alone ran 239,186,304 times, needed
+the host 27,817 times, and went on to itself 98.4% of the time. The guest
+made 831,806,301 loads and stores: 67.9% to SDRAM, 31.0% to L1 data bank A
+(mostly 16-bit reads), and the FIR block made 58% of them, two per run.
 
 ### Service census
 
@@ -374,6 +411,7 @@ python3 -m op1prof run    --binary $B $IN --census
 python3 -m op1prof census op1prof-run-*/run --phase main-boot:lap-end
 python3 -m op1prof compile op1prof-run-*/run --phase main-boot:main-display
 python3 -m op1prof census op1prof-run-*/run --phase main-boot:main-display --edges
+python3 -m op1prof census op1prof-run-*/run --phase main-boot:main-display --exits   # or --memory
 python3 -m op1prof service op1prof-run-*/run --phase main-boot:main-display --capture op1prof-perf-*/capture
 python3 -m op1prof diverge op1prof-run-A/run op1prof-run-B/run   # runs made with --checksum N
 python3 -m op1prof perf   --binary $B $IN --window main-boot:main-display
@@ -528,6 +566,19 @@ for the busiest blocks, how many successors each has and what share of its
 runs went to the most common one: a block that nearly always continues to
 the same successor is a candidate to join with it, one with many successors
 is not.
+
+`census --exits` splits a phase's block runs by why the host was needed
+after them (an MMR, host work the guest could see, both, or neither),
+groups them by where decoding ended the block (the trace's `terminator`, a
+static label: runs that left earlier, through a taken branch or a hardware
+loop, count under it too), and
+lists the blocks with the most runs that needed nothing, with their most
+common successor: the candidates for running more than one block per host
+call. A run the census saw no reason for still has to find its successor,
+so this is an upper bound on what staying in generated code saves, not a
+measure of it. `census --memory` reports guest loads and stores by device and
+width and the blocks that access memory most per run; `report --census`
+adds accesses per run and ns per access to its block table.
 
 `service RUNDIR --phase A:B` reports the service census of a `run --census`:
 the devices that published levels or did anything, with their calls,

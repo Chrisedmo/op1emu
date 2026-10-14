@@ -3,6 +3,7 @@
   "roots": ["BlackFinCpu::Run(", "BootExcutionThread(", "LdrExecutionThread("],
   "categories": [
     {"name": "profiler",         "match": ["Profiler::", "FrameTap::"]},
+    {"name": "logging",          "match": ["LogImpl(", "LogDebug(", "LogInfo(", "LogWarn(", "LogError(", "spdlog::"]},
     {"name": "nand",             "match": ["NFC::", "NandFlash::", "MT29F4G08::"]},
     {"name": "sport/audio",      "match": ["SPORT::", "AudioOutput"]},
     {"name": "ppi/display",      "match": ["PPI::", "Display::", "OLED::"]},

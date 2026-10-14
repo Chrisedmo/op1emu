@@ -3,6 +3,7 @@
 #include "cpu/cpu.h"
 #include "hw_counters.h"
 #include "mark_set.h"
+#include "memory_census.h"
 #include "probes.h"
 #include "service_stats.h"
 #include "sha256.h"
@@ -142,6 +143,15 @@ struct Profiler::Impl : BcoreEventSink {
 
     bool census = false;
     profiling::ServiceStats* service = nullptr;  // owned by the CPU (census runs)
+    profiling::MemoryCensus* memory = nullptr;   // owned by the CPU (census runs)
+    // Exit census: per block, the runs after which the host was needed
+    // because the block touched an MMR, because the host then did something
+    // the guest can see, or both; and the block's memory accesses.
+    struct ExitCount { uint64_t mmio = 0, host = 0, both = 0, accesses = 0; };
+    std::unordered_map<uint32_t, ExitCount> exitCensus;
+    bool exitPending = false, blockMmio = false;
+    uint32_t exitPc = 0, exitIpend = 0;
+    uint64_t exitHostMark = 0, blockAccessesStart = 0, exitAccesses = 0;
     struct PcCount { uint64_t runs = 0, packets = 0; };
     struct MmioCount {
         uint64_t reads = 0, writes = 0;
@@ -293,7 +303,10 @@ struct Profiler::Impl : BcoreEventSink {
                 throw std::runtime_error("Cannot open perf control fifo " + options.perfFifo + ": " + std::strerror(errno));
         }
         census = !options.censusPrefix.empty();
-        if (census) service = &cpu.EnableServiceStats();
+        if (census) {
+            service = &cpu.EnableServiceStats();
+            memory = &cpu.EnableMemoryCensus();
+        }
         if (!options.checksumPath.empty()) {
             if (options.checksumEvery == 0) throw std::runtime_error("--profile-checksum-every must be at least 1");
             checksums = std::fopen(options.checksumPath.c_str(), "wb");
@@ -346,8 +359,12 @@ struct Profiler::Impl : BcoreEventSink {
         if (ReadCounters(values)) translateInsnsBegin = values.instructions;
         translateBegin = MonotonicNs();
         translateCpuBegin = ThreadCpuNs();
+        if (memory) memory->paused = true;
     }
     void Translated(uint32_t pc, bool ok) {
+        // After a failed translation too: bcore reports the failure before
+        // the exception leaves Core::run.
+        if (memory) memory->paused = false;
         Event event;
         event.name = "translate";
         event.begin = translateBegin;
@@ -445,7 +462,9 @@ struct Profiler::Impl : BcoreEventSink {
         startWall = MonotonicNs();
         startCpu = ThreadCpuNs();
         startProcessCpu = ProcessCpuNs();
-        if (!events.empty() || !options.dumpIrPcs.empty()) cpu.SetCoreEventSink(this);
+        // The census needs the translation brackets to leave instruction
+        // fetches out of the guest's memory accesses.
+        if (!events.empty() || !options.dumpIrPcs.empty() || census) cpu.SetCoreEventSink(this);
         if (options.jitdump) cpu.SetPerfJitdump(true);
         Fire("start", pc);
     }
@@ -568,6 +587,47 @@ struct Profiler::Impl : BcoreEventSink {
         return std::fclose(file) == 0 && ok;
     }
 
+    // What the host did after a block that the guest can see: productive
+    // device calls, raises delivered and other events, new ILAT bits, GP
+    // timer ticks. Any change between two readings means it did something.
+    uint64_t HostWork() const {
+        return service->productiveTotal + service->latchedTotal + service->timerTicks +
+               (cpu.EventsDelivered() - service->raisedTotal);
+    }
+    static uint32_t Ipend() { return cec_mmr_read(nullptr, CEC_MMR_BASE + 4 * CEC_IDX_IPEND); }
+
+    void CloseExit() {
+        // The window from the end of the block to the start of the next:
+        // device service, events, the CEC taking an interrupt, the next
+        // run's timer update.
+        const bool host = HostWork() != exitHostMark || Ipend() != exitIpend;
+        auto& count = exitCensus[exitPc];
+        if (blockMmio && host) ++count.both;
+        else if (blockMmio) ++count.mmio;
+        else if (host) ++count.host;
+        count.accesses += exitAccesses;
+        exitPending = false;
+    }
+
+    // Cumulative exit counts as little-endian records
+    // (u32 block, u32 0, u64 mmio only, u64 host only, u64 both, u64 accesses), sorted.
+    bool WriteExits(const std::string& path) {
+        std::vector<uint32_t> keys;
+        for (const auto& [key, value] : exitCensus) keys.push_back(key);
+        std::sort(keys.begin(), keys.end());
+        FILE* file = std::fopen(path.c_str(), "wb");
+        if (!file) return false;
+        bool ok = true;
+        const uint32_t pad = 0;
+        for (uint32_t key : keys) {
+            const auto& c = exitCensus.at(key);
+            const uint64_t fields[4] = {c.mmio, c.host, c.both, c.accesses};
+            ok = ok && std::fwrite(&key, 4, 1, file) == 1 && std::fwrite(&pad, 4, 1, file) == 1 &&
+                 std::fwrite(fields, sizeof(fields), 1, file) == 1;
+        }
+        return std::fclose(file) == 0 && ok;
+    }
+
     // Cumulative edge counts as little-endian records (u32 from, u32 to, u64 count), sorted.
     bool WriteEdges(const std::string& path) {
         std::vector<std::pair<uint64_t, uint64_t>> edges(edgeCensus.begin(), edgeCensus.end());
@@ -618,7 +678,8 @@ struct Profiler::Impl : BcoreEventSink {
             WriteCensus(base + "pc." + mark, pcCensus, [](const PcCount& c) { return std::pair{c.runs, c.packets}; }) &&
             WriteCensus(base + "mmio." + mark, mmioCensus, [](const MmioCount& c) { return std::pair{c.reads, c.writes}; }) &&
             WriteEdges(base + "edge." + mark) && WriteMmioFirst(base + "mmiofirst." + mark) &&
-            service->Write(base + "service." + mark, cpu.IrqLatched(), cpu.CoreStats());
+            service->Write(base + "service." + mark, cpu.IrqLatched(), cpu.CoreStats()) &&
+            memory->Write(base + "memory." + mark) && WriteExits(base + "exit." + mark);
         if (!ok) {
             LogError("Failed to write census %s*.%s", base.c_str(), mark);
             censusFailed = true;
@@ -704,6 +765,8 @@ struct Profiler::Impl : BcoreEventSink {
                                        ",\"object_bytes\":%" PRIu64 ",\"object_hash\":\"%016" PRIx64 "\",\"collect_ns\":%" PRIu64,
                                  e.cpu_ns, e.shape.ir_instructions, e.shape.ir_blocks, e.shape.object_bytes,
                                  e.shape.object_hash, e.shape.collect_ns);
+                    // A static string from bcore: what ends the block.
+                    if (e.ok && e.shape.terminator) std::fprintf(file, ",\"terminator\":\"%s\"", e.shape.terminator);
                 }
                 if (invalidate) std::fprintf(file, ",\"cpu_ns\":%" PRIu64, e.cpu_ns);
                 if ((translate || invalidate) && counted) std::fprintf(file, ",\"insns\":%" PRIu64, e.insns);
@@ -756,6 +819,10 @@ void Profiler::BeforeRun(uint32_t pc) {
         if (impl.haveLastPc) ++impl.edgeCensus[uint64_t(impl.lastPc) << 32 | pc];
         impl.lastPc = pc;
         impl.haveLastPc = true;
+        // Like the edge, the exit of the previous block belongs with it.
+        if (impl.exitPending) impl.CloseExit();
+        impl.blockMmio = false;
+        impl.blockAccessesStart = impl.memory->accesses;
     }
     if (impl.framePending) {
         impl.framePending = false;
@@ -781,6 +848,11 @@ void Profiler::AfterRun(uint32_t pc, uint32_t packets) {
         auto& count = impl.pcCensus[pc];
         ++count.runs;
         count.packets += packets;
+        impl.exitPending = true;
+        impl.exitPc = pc;
+        impl.exitAccesses = impl.memory->accesses - impl.blockAccessesStart;
+        impl.exitHostMark = impl.HostWork();
+        impl.exitIpend = impl.Ipend();
     }
 }
 
@@ -789,6 +861,7 @@ void Profiler::OnMmio(uint32_t addr, bool write) {
     if (write) ++impl.mmioWrites;
     else ++impl.mmioReads;
     if (impl.census) {
+        impl.blockMmio = true;
         auto& count = impl.mmioCensus[addr];
         // Guest time: in deterministic mode the packets before this block.
         const uint64_t cycles = impl.cpu.Time().Cycles();

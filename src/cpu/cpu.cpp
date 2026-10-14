@@ -18,6 +18,7 @@
 #include "emu.h"
 #ifdef ENABLE_PROFILING
 #include "profiling/profiler.h"
+#include "profiling/memory_census.h"
 #include "profiling/service_stats.h"
 #include <cstdlib>
 #include <cxxabi.h>
@@ -412,6 +413,9 @@ HaltReason BlackFinCpu::Run() {
 #endif
             ticks = kMaxCatchupTicks;
         }
+#ifdef ENABLE_PROFILING
+        if (auto* stats = Service()) stats->timerTicks += ticks;
+#endif
         for (uint64_t i = 0; i < ticks; ++i) {
             gptimer->Tick(GPTimerClockTypeSCLK);
             gptimer->Tick(GPTimerClockTypeTACLK);
@@ -551,6 +555,17 @@ profiling::ServiceStats& BlackFinCpu::EnableServiceStats() {
     return *serviceStats_;
 }
 
+profiling::MemoryCensus& BlackFinCpu::EnableMemoryCensus() {
+    if (memoryCensus_) return *memoryCensus_;
+    std::vector<profiling::MemoryCensus::DeviceRange> ranges;
+    for (const Device* device : emulator.Devices())
+        ranges.push_back({device->Name(), device->BaseAddress(), device->EndAddress()});
+    memoryCensus_ = std::make_unique<profiling::MemoryCensus>();
+    memoryCensus_->SetDevices(ranges);
+    bcoreMemory_->SetMemoryCensus(memoryCensus_.get());
+    return *memoryCensus_;
+}
+
 // The device loop of Run() with each call counted, and counted as productive
 // when it changed an interrupt level, queued an event other than a raise, or
 // moved data. Taken only in census runs.
@@ -565,7 +580,10 @@ void BlackFinCpu::ServiceDevicesCounted(int ivg) {
         const uint64_t moved = devices[i]->ServiceWork() - work;
         source.work += moved;
         ++source.calls;
-        if (moved || source.transitions + source.queued != before) ++source.productive;
+        if (moved || source.transitions + source.queued != before) {
+            ++source.productive;
+            ++stats.productiveTotal;
+        }
     }
     stats.current = stats.other;
 }
@@ -578,9 +596,13 @@ void BlackFinCpu::RaiseInterrupt(int ivg) {
     // something the guest can see.
     const uint32_t ilatAddr = CEC_MMR_BASE + 4 * CEC_IDX_ILAT;
     const uint32_t before = cec_mmr_read(cpuState_.get(), ilatAddr);
-    if (auto* stats = Service(); stats && ivg >= 0 && ivg < 16) ++stats->raised[ivg];
+    if (auto* stats = Service(); stats && ivg >= 0 && ivg < 16) {
+        ++stats->raised[ivg];
+        ++stats->raisedTotal;
+    }
     cec_raise(cpuState_.get(), ivg);
     const uint32_t latched = cec_mmr_read(cpuState_.get(), ilatAddr) & ~before;
+    if (auto* stats = Service()) stats->latchedTotal += __builtin_popcount(latched);
     for (int level = 0; level < 16; ++level)
         if (latched >> level & 1) ++irqLatched_[level];
 #else

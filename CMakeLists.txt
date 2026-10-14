@@ -164,7 +164,7 @@ if(OP1_BUILD_HEADLESS_TESTS)
         target_include_directories(op1-mark-set-test PRIVATE src)
         add_test(NAME op1-mark-set-test COMMAND op1-mark-set-test)
         add_executable(op1-service-stats-test tests/service_stats_test.cpp)
-        target_link_libraries(op1-service-stats-test PRIVATE emulator Threads::Threads)
+        target_link_libraries(op1-service-stats-test PRIVATE emulator bfin-core Threads::Threads)
         add_test(NAME op1-service-stats-test COMMAND op1-service-stats-test)
     endif()
 

@@ -1,13 +1,15 @@
 #include "bcore_memory.h"
 #ifdef ENABLE_PROFILING
+#include "profiling/memory_census.h"
 #include "profiling/profiler.h"
 
-void EmulatorMemory::Mmio(uint32_t addr, bool write) const {
+void EmulatorMemory::Access(uint32_t addr, int widthIndex, bool write) const {
+    if (census_) census_->Count(addr, widthIndex, write);
     if (profiler_ && addr >= 0xFFC00000) profiler_->OnMmio(addr, write);
 }
-#define PROFILE_MMIO(addr, write) Mmio(addr, write)
+#define PROFILE_ACCESS(addr, width, write) Access(addr, width, write)
 #else
-#define PROFILE_MMIO(addr, write) ((void)0)
+#define PROFILE_ACCESS(addr, width, write) ((void)0)
 #endif
 
 EmulatorMemory::EmulatorMemory(Emulator& emulator)
@@ -26,32 +28,32 @@ uintptr_t EmulatorMemory::fast_base() const {
 }
 
 uint8_t EmulatorMemory::read8(uint32_t addr) const {
-    PROFILE_MMIO(addr, false);
+    PROFILE_ACCESS(addr, 0, false);
     return emulator_.MemoryRead8(addr);
 }
 
 uint16_t EmulatorMemory::read16(uint32_t addr) const {
-    PROFILE_MMIO(addr, false);
+    PROFILE_ACCESS(addr, 1, false);
     return emulator_.MemoryRead16(addr);
 }
 
 uint32_t EmulatorMemory::read32(uint32_t addr) const {
-    PROFILE_MMIO(addr, false);
+    PROFILE_ACCESS(addr, 2, false);
     return emulator_.MemoryRead32(addr);
 }
 
 void EmulatorMemory::write8(uint32_t addr, uint8_t val) {
-    PROFILE_MMIO(addr, true);
+    PROFILE_ACCESS(addr, 0, true);
     emulator_.MemoryWrite8(addr, val);
 }
 
 void EmulatorMemory::write16(uint32_t addr, uint16_t val) {
-    PROFILE_MMIO(addr, true);
+    PROFILE_ACCESS(addr, 1, true);
     emulator_.MemoryWrite16(addr, val);
 }
 
 void EmulatorMemory::write32(uint32_t addr, uint32_t val) {
-    PROFILE_MMIO(addr, true);
+    PROFILE_ACCESS(addr, 2, true);
     emulator_.MemoryWrite32(addr, val);
 }
 

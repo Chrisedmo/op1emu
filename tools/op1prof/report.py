@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-from . import census, trace
+from . import census, exits, trace
 from .perf import is_software_event
 from .categories import Categories
 from .marks import Mark, parse_marks, workload_diff
@@ -255,6 +255,12 @@ def join_census(result: Attribution, census_run: Path, capture: Path, window: Tu
         row = counts.setdefault(labels(pc), [0, 0])
         row[0] += runs
         row[1] += packets
+    # Memory accesses per block, from the exit census (newer census runs).
+    accesses: Optional[Dict[str, int]] = None
+    if Path(f"{census_run / 'census'}.exit.{window[1]}").is_file():
+        accesses = {}
+        for pc, (_, _, _, count) in exits.exit_phase(census_run / "census", *window).items():
+            accesses[labels(pc)] = accesses.get(labels(pc), 0) + count
     total_runs = sum(runs for runs, _ in counts.values())
     in_blocks = sum(weight for name, weight in result.incl_blocks.items() if name in counts)
     # Sampled in a block the census never ran in this phase: a window edge,
@@ -263,9 +269,14 @@ def join_census(result: Attribution, census_run: Path, capture: Path, window: Tu
     rows = []
     for name, (runs, packets) in counts.items():
         seconds = result.incl_blocks.get(name, 0) * seconds_per_weight
-        rows.append({"block": name, "runs": runs, "packets": packets, "seconds": seconds,
-                     "ns_per_run": seconds * 1e9 / runs if runs else 0.0,
-                     "ns_per_packet": seconds * 1e9 / packets if packets else 0.0})
+        row = {"block": name, "runs": runs, "packets": packets, "seconds": seconds,
+               "ns_per_run": seconds * 1e9 / runs if runs else 0.0,
+               "ns_per_packet": seconds * 1e9 / packets if packets else 0.0}
+        if accesses is not None:
+            count = accesses.get(name, 0)
+            row["accesses_per_run"] = count / runs if runs else 0.0
+            row["ns_per_access"] = seconds * 1e9 / count if count else None
+        rows.append(row)
     rows.sort(key=lambda row: -row["seconds"])
     host = (result.execution - in_blocks - unmatched) * seconds_per_weight
     return {"window": list(window), "runs": total_runs, "blocks": rows,
@@ -379,8 +390,13 @@ def _census_lines(joined: dict, limit: int, sort: str) -> List[str]:
              f"outside guest blocks (dispatch, devices, event queue, CPU loop): "
              f"{joined['outside_blocks_s']:.3f} s = {joined['outside_blocks_ns_per_run']:.1f} ns per run; "
              f"sampled in blocks the census did not run: {joined['sampled_not_in_census_s']:.3f} s",
-             f"{'guest block':40s} {'runs':>12} {'packets':>13} {'seconds':>9} {'ns/run':>8} {'ns/pkt':>7}"]
+             f"{'guest block':40s} {'runs':>12} {'packets':>13} {'seconds':>9} {'ns/run':>8} {'ns/pkt':>7}"
+             + (f" {'acc/run':>8} {'ns/acc':>7}" if rows and "accesses_per_run" in rows[0] else "")]
     for row in rows[:limit]:
-        lines.append(f"{row['block'][:40]:40s} {row['runs']:>12} {row['packets']:>13} {row['seconds']:9.3f} "
-                     f"{row['ns_per_run']:8.1f} {row['ns_per_packet']:7.2f}")
+        line = (f"{row['block'][:40]:40s} {row['runs']:>12} {row['packets']:>13} {row['seconds']:9.3f} "
+                f"{row['ns_per_run']:8.1f} {row['ns_per_packet']:7.2f}")
+        if "accesses_per_run" in row:
+            per = row["ns_per_access"]
+            line += f" {row['accesses_per_run']:8.1f} {per if per is not None else 0:7.2f}"
+        lines.append(line)
     return lines

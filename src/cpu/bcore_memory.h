@@ -7,6 +7,7 @@
 #include "emu.h"
 
 class Profiler;
+namespace profiling { struct MemoryCensus; }
 
 class EmulatorMemory : public Memory {
 public:
@@ -31,12 +32,15 @@ public:
 #ifdef ENABLE_PROFILING
     // Counts guest accesses to the MMR space (0xFFC00000 and up). Not owned.
     void SetProfiler(Profiler* profiler) { profiler_ = profiler; }
+    // Counts every access by device and width (census runs). Not owned.
+    void SetMemoryCensus(profiling::MemoryCensus* census) { census_ = census; }
 #endif
 
 private:
     Emulator& emulator_;
 #ifdef ENABLE_PROFILING
     Profiler* profiler_ = nullptr;
-    void Mmio(uint32_t addr, bool write) const;
+    profiling::MemoryCensus* census_ = nullptr;
+    void Access(uint32_t addr, int widthIndex, bool write) const;
 #endif
 };

@@ -5,7 +5,7 @@ Runs op1emu with marks, trace and census on the one-RTS LDR of ldr_smoke.py
 and a small erased NAND image, then checks what it recorded: the build line,
 the start and range marks, a v4 trace with the JIT cache flush at the L1
 entry, census dumps whose block-to-block transitions match the block runs, a
-service census,
+service, memory and exit census,
 and that wrong options fail before the CPU starts.
 
 usage: profile_smoke.py OP1EMU
@@ -50,6 +50,9 @@ def check(op1emu, work):
     if fired != ["start", "l1"]:
         return f"marks fired {fired}, expected start and l1\n{tail(output)}"
     trace = json.loads((work / "trace.json").read_text())
+    kinds = [e["args"].get("terminator") for e in trace["traceEvents"] if e["name"] == "translate"]
+    if not kinds or kinds[-1] != "return":
+        return f"the RTS block's translation does not end in a return: {kinds}"
     if trace.get("schema") != "op1.trace.v4" or trace.get("build") != build[0] or trace.get("dropped"):
         return f"trace header: {({k: v for k, v in trace.items() if k != 'traceEvents'})}"
     flushes = [e for e in trace["traceEvents"] if e["name"] == "invalidate"]
@@ -69,6 +72,12 @@ def check(op1emu, work):
         if service.get("schema") != "op1.service.v1" or names[-3:] != ["block", "events", "other"] or \
                 service["bcore"]["blocks_executed"] != sum(runs.values()):
             return f"service census at {mark}: {({k: v for k, v in service.items() if k != 'sources'})}, {names}"
+        memory = json.loads((work / f"census.memory.{mark}").read_text())
+        exits = records(work / f"census.exit.{mark}", "<IIQQQQ")
+        if memory.get("schema") != "op1.memory.v1" or memory["regions"][-1]["name"] != "unmapped" or \
+                any(sum(row[2:5]) > runs.get(row[0], 0) for row in exits) or \
+                sum(row[5] for row in exits) > memory["accesses"]:
+            return f"memory or exit census at {mark}: {memory.get('accesses')} accesses, exits {exits}"
 
     # Wrong settings fail before the CPU starts.
     (work / "other.json").write_text(json.dumps({**marks, "nand_sha256": "0" * 64}))

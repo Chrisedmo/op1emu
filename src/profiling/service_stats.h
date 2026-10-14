@@ -55,6 +55,10 @@ struct ServiceStats {
     // Set when the CPU thread starts; until then every caller is another thread.
     std::atomic<std::thread::id> cpuThread{};
     uint64_t timerTicksDropped = 0;
+    // Running totals of what the host did that the guest can see, for the
+    // exit census: productive device calls, raises delivered, new ILAT bits
+    // and GP timer ticks.
+    uint64_t productiveTotal = 0, raisedTotal = 0, latchedTotal = 0, timerTicks = 0;
 
     struct DeviceInfo {
         std::string name, type;

@@ -8,7 +8,7 @@ import time
 from typing import List
 from pathlib import Path
 
-from . import ab, census, compilation, diverge, machine, perf, probes, service, stats, trace, verify
+from . import ab, census, compilation, diverge, exits, machine, perf, probes, service, stats, trace, verify
 from . import report as perf_report
 from .categories import Categories
 from . import marks as marks_file
@@ -440,7 +440,13 @@ def cmd_census(args) -> int:
         raise SystemExit("--phase must be BEGIN:END")
     symbols = census.Symbols(args.symbols)
     try:
-        if args.edges:
+        if args.exits:
+            data = exits.exits(args.run / "census", trace.load(str(args.run / "trace.json")), begin, end)
+            print(exits.exits_report(data, census.edge_phase(args.run / "census", begin, end), args.top, symbols))
+        elif args.memory:
+            data = exits.exits(args.run / "census", trace.load(str(args.run / "trace.json")), begin, end)
+            print(exits.memory_report(exits.memory_phase(args.run / "census", begin, end), data, args.top, symbols))
+        elif args.edges:
             print(census.edge_report(args.run / "census", begin, end, args.top, symbols))
         elif args.mmio_first:
             from .marks import parse_marks
@@ -575,6 +581,9 @@ def main(argv=None) -> int:
     p.add_argument("--symbols", type=Path, help="ADDRESS NAME lines to name PCs")
     p.add_argument("--edges", action="store_true", help="block-to-block transitions instead of per-block counts")
     p.add_argument("--mmio-first", action="store_true", help="MMRs first accessed in the phase, in order")
+    p.add_argument("--exits", action="store_true",
+                   help="after which blocks the host had to act, by what ends the block")
+    p.add_argument("--memory", action="store_true", help="guest loads and stores by device and width, and by block")
     p.set_defaults(func=cmd_census)
 
     p = sub.add_parser("service", help="device service calls, the interrupt chain and the event queue of a --census run")

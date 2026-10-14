@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from op1prof import ab, census, cli, compilation, machine, service, stats, trace, verify  # noqa: E402
+from op1prof import ab, census, cli, compilation, exits, machine, service, stats, trace, verify  # noqa: E402
 from op1prof.marks import parse_mark, workload_diff, parse_marks  # noqa: E402
 from op1prof.runner import RESERVED_ARGS, RunSpec, run, snapshot_binary, sha256_file  # noqa: E402
 
@@ -495,6 +495,15 @@ def test_census_join_prices_block_runs_and_refuses_other_work(tmp_path):
     assert rows["bb_0x00000200"]["seconds"] == 0
     assert data["census"]["outside_blocks_ns_per_run"] == pytest.approx(50 * per_weight * 1e9 / 7)
     assert "ns/run" in perf_report.format_report(data, 10, "ns-per-run")
+    # With an exit census the join also gives each block's memory accesses.
+    _exits(census_run / "census.exit.a", {0x01a5e27e: (0, 0, 0, 2)})
+    _exits(census_run / "census.exit.b", {0x01a5e27e: (0, 0, 0, 10), 0x200: (0, 0, 0, 6)})
+    with_accesses = perf_report.analyze(capture, Categories.load(), labels, census_run=census_run, samples=samples)
+    fir = {row["block"]: row for row in with_accesses["census"]["blocks"]}["fir"]
+    assert fir["accesses_per_run"] == pytest.approx(8 / 4) and fir["ns_per_access"] == pytest.approx(fir["seconds"] * 1e9 / 8)
+    assert "acc/run" in perf_report.format_report(with_accesses, 10)
+    for mark in "ab":
+        (census_run / f"census.exit.{mark}").unlink()
     _census_run_entry(census_run, [marks[0], _mark_entry("b", 21)])
     with pytest.raises(ValueError, match="different guest work"):
         perf_report.analyze(capture, Categories.load(), labels, census_run=census_run, samples=samples)
@@ -1470,3 +1479,87 @@ def test_devices_that_inherit_their_service_method_share_its_time():
     text = service.report(service.join(data, capture, implemented), 10)
     assert "(Device's, shared)" in text and "2 devices run Device::ProcessWithInterrupt: 0.020 s together" in text
     assert "(no ProcessWithInterrupt found for Odd)" in text
+
+
+# ---- exit and memory censuses ----
+
+def _exits(path, rows):
+    path.write_bytes(b"".join(exits.EXIT.pack(pc, 0, *values) for pc, values in sorted(rows.items())))
+
+
+def _memory(path, scale):
+    path.write_text(json.dumps({"schema": "op1.memory.v1", "accesses": 30 * scale, "regions": [
+        {"name": "SDRAM", "base": 0, "end": 0x7ffffff, "reads": [0, 0, 20 * scale], "writes": [0, 0, 8 * scale]},
+        {"name": "NFC", "base": 0xffc03700, "end": 0xffc0374f, "reads": [0, 2 * scale, 0], "writes": [0, 0, 0]},
+        {"name": "unmapped", "base": 0, "end": 0, "reads": [0, 0, 0], "writes": [0, 0, 0]}]}))
+
+
+def _exit_run(tmp_path):
+    prefix = tmp_path / "census"
+    _census(Path(f"{prefix}.pc.a"), [(0x100, 10, 40), (0x200, 5, 5)])
+    _census(Path(f"{prefix}.pc.b"), [(0x100, 110, 440), (0x200, 25, 25)])
+    _exits(Path(f"{prefix}.exit.a"), {0x100: (0, 0, 0, 20), 0x200: (1, 0, 0, 5)})
+    _exits(Path(f"{prefix}.exit.b"), {0x100: (0, 2, 0, 220), 0x200: (11, 2, 1, 25)})
+    Path(f"{prefix}.edge.a").write_bytes(b"")
+    Path(f"{prefix}.edge.b").write_bytes(census.EDGE.pack(0x100, 0x100, 98) + census.EDGE.pack(0x100, 0x200, 2))
+    t = _trace([_mark("a", 0, 0, 0),
+                {**_translate(10, 1, 1), "args": {"cpu_ns": 1, "pc": 0x100, "terminator": "jump"}},
+                {**_translate(20, 1, 1), "args": {"cpu_ns": 1, "pc": 0x200, "terminator": "loop-setup"}},
+                _mark("b", 1000, 0, 0)])
+    return prefix, t
+
+
+def test_exit_census_splits_runs_by_why_the_host_was_needed(tmp_path):
+    prefix, t = _exit_run(tmp_path)
+    data = exits.exits(prefix, t, "a", "b")
+    rows = {b["pc"]: b for b in data["blocks"]}
+    assert rows[0x100] == {"pc": 0x100, "runs": 100, "packets": 400, "mmio": 0, "host": 2, "both": 0, "free": 98,
+                           "accesses": 200, "terminator": "jump"}
+    assert rows[0x200]["free"] == 20 - 10 - 2 - 1 and rows[0x200]["terminator"] == "loop-setup"
+    text = exits.exits_report(data, census.edge_phase(prefix, "a", "b"), 10, census.Symbols(None))
+    assert "not needed (no MMR, nothing the guest saw):              105" in text
+    assert "jump                     1           100            98  98.0%" in text
+    assert "0x00000100          100           98  98.0% jump             0x00000100  98.0%" in text
+
+
+def test_exit_census_cannot_need_the_host_more_often_than_a_block_ran(tmp_path):
+    prefix, t = _exit_run(tmp_path)
+    _exits(Path(f"{prefix}.exit.b"), {0x100: (0, 200, 0, 220), 0x200: (11, 2, 1, 25)})
+    with pytest.raises(ValueError, match="needed the host, but it ran"):
+        exits.exits(prefix, t, "a", "b")
+    _exits(Path(f"{prefix}.exit.b"), {0x100: (0, 2, 0, 220), 0x300: (1, 0, 0, 0)})
+    with pytest.raises(ValueError, match="never ran"):
+        exits.exits(prefix, t, "a", "b")
+
+
+def test_memory_census_by_device_and_block(tmp_path):
+    prefix, t = _exit_run(tmp_path)
+    _memory(Path(f"{prefix}.memory.a"), 1)
+    _memory(Path(f"{prefix}.memory.b"), 4)
+    memory = exits.memory_phase(prefix, "a", "b")
+    assert memory["accesses"] == 90 and [r["name"] for r in memory["regions"]] == ["SDRAM", "NFC"]
+    text = exits.memory_report(memory, exits.exits(prefix, t, "a", "b"), 5, census.Symbols(None))
+    assert "SDRAM              0x00000000-0x07ffffff" in text and "unmapped" not in text
+    assert "0x00000100          100           200      2.0" in text
+    with pytest.raises(ValueError, match="went down"):
+        exits.memory_phase(prefix, "b", "a")
+
+
+def test_census_command_reports_exits_and_memory(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    prefix, t = _exit_run(run_dir)
+    (run_dir / "trace.json").write_text(json.dumps(t))
+    _memory(Path(f"{prefix}.memory.a"), 1)
+    _memory(Path(f"{prefix}.memory.b"), 2)
+    assert cli.main(["census", str(run_dir), "--phase", "a:b", "--exits"]) == 0
+    assert "block ends in" in capsys.readouterr().out
+    assert cli.main(["census", str(run_dir), "--phase", "a:b", "--memory"]) == 0
+    assert "guest loads and stores" in capsys.readouterr().out
+
+
+def test_logging_is_its_own_bucket():
+    categories = Categories.load()
+    assert categories.bucket(["vsnprintf", "LogImpl(LogLevel, char const*, __va_list_tag*)",
+                              "LogDebug(char const*, ...)", "get_device(unsigned int, ...)",
+                              "Emulator::MemoryRead32(unsigned int)"]) == "logging"
