@@ -1920,3 +1920,41 @@ def test_ab_perf_checks_perf_before_the_timing_runs(files, tmp_path, monkeypatch
         cli.main(["ab", "--base-bin", str(FAKE), "--nand", str(files / "nand.bin"), "--otp", str(files / "otp.bin"),
                   "--marks", str(files / "marks.json"), "--force", "--out", str(tmp_path / "ab"), "--aa", "--perf", "3"])
     assert not (tmp_path / "ab").exists()
+
+
+# ---- perf's build-id cache ----
+
+def test_a_capture_keeps_perfs_build_id_cache_inside_itself(files, tmp_path, monkeypatch):
+    # perf copies every DSO it samples into ~/.debug, which outlives the
+    # capture: a capture gets its own cache, used by every perf command on it.
+    seen = {}
+    def fake_run(spec, directory):
+        seen["prefix"] = spec.prefix
+        return run(spec_without_prefix(spec), directory)
+    def spec_without_prefix(spec):
+        from dataclasses import replace
+        return replace(spec, prefix=[])
+    monkeypatch.setattr(perf, "run", fake_run)
+    # perf inject runs after a reached run: recorded here, so the test needs no perf.
+    class Done:
+        returncode, stderr = 0, ""
+    commands = []
+    monkeypatch.setattr(perf.subprocess, "run", lambda command, **kw: commands.append(command) or Done())
+    capture = tmp_path / "capture"
+    perf.record(spec(files), capture, ("start", "main-frame"), "cycles:u", 4000000, None)
+    cache = (capture / perf.BUILDID_DIR).resolve()
+    assert cache.is_dir() and seen["prefix"][:4] == ["perf", "--buildid-dir", str(cache), "record"]
+    assert [c[:4] for c in commands] == [["perf", "--buildid-dir", str(cache), "inject"]]
+    assert perf.perf_command(capture) == ["perf", "--buildid-dir", str(cache)]
+    old = tmp_path / "old-capture"
+    old.mkdir()
+    assert perf.perf_command(old) == ["perf"]          # a capture from before keeps using ~/.debug
+
+
+def test_the_permission_probe_caches_nothing(monkeypatch):
+    calls = []
+    class Done:
+        returncode, stderr = 0, ""
+    monkeypatch.setattr(perf.subprocess, "run", lambda command, **kw: calls.append(command) or Done())
+    assert perf.preflight("cycles:u", ["-c", "4000000"]) is None
+    assert "--no-buildid-cache" in calls[0]

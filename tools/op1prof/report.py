@@ -353,7 +353,8 @@ def analyze(capture: Path, categories: Categories, labels: Labels, callers_of: O
 
 
 def _perf_script(data: Path) -> List[str]:
-    script = subprocess.run(["perf", "script", "-i", str(data), "-F", "tid,time,period,ip,sym,dso", "--ns"],
+    script = subprocess.run([*perf.perf_command(data.parent), "script", "-i", str(data), "-F",
+                             "tid,time,period,ip,sym,dso", "--ns"],
                             capture_output=True, text=True)
     if script.returncode != 0:
         raise RuntimeError(f"perf script failed: {script.stderr.strip()[-300:]}")

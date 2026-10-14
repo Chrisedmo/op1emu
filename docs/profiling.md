@@ -663,7 +663,21 @@ window end, is rejected rather than recorded empty, and a capture fails if
 its window marks did not both fire or the marks fired out of file order),
 then `perf inject --jit`. It checks first that perf may
 record the event; it never changes `kernel.perf_event_paranoid` but says what
-to set (2 is enough). Every capture records perf's own counts of samples,
+to set (2 is enough).
+
+perf copies every file it records samples in into its build-id cache,
+`~/.debug` unless told otherwise, and those copies outlive the capture: a
+boot capture samples the binary snapshot and tens of thousands of
+`jitted-*.so` files that `perf inject` writes (26,790 files, 276 MB between
+`main-boot` and `lap-end`), and a few rounds of captures had filled 19 GB
+and the disk. Every perf command op1prof runs on a capture therefore passes
+`perf --buildid-dir CAPTURE/buildid` (perf 6.8 ignores the
+`PERF_BUILDID_DIR` variable): the cache lives in the capture, is deleted
+with it, and keeps `report` and `annotate` working after the binary
+snapshot is gone. Captures from before it still use `~/.debug`; what is
+left there from them can be removed with the captures they belonged to.
+
+Every capture records perf's own counts of samples,
 lost samples and throttling in `capture.json` (samples from `perf report
 --stats`; lost samples and throttling from the records in `perf report -D`,
 since `--stats` counts records and one record can stand for hundreds of

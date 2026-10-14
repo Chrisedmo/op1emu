@@ -74,7 +74,8 @@ def annotate(capture: Path, pc: int, allow_imprecise: bool, lines: int) -> str:
         raise ValueError(f"{info['event']} is not a precise event, so it cannot rank instructions: capture with "
                          "--event cycles:upp (or pass --allow-imprecise to see it anyway)")
     symbol = f"bb_0x{pc:08x}"
-    result = subprocess.run(["perf", "annotate", "-i", str(capture / "perf.jit.data"), "--stdio", "-s", symbol],
+    result = subprocess.run([*perf_command(capture), "annotate", "-i", str(capture / "perf.jit.data"), "--stdio",
+                             "-s", symbol],
                             capture_output=True, text=True)
     if result.returncode != 0 or not result.stdout.strip():
         raise ValueError(f"perf annotate found no samples in {symbol}: {result.stderr.strip()[-300:]}")
@@ -87,13 +88,29 @@ def annotate(capture: Path, pc: int, allow_imprecise: bool, lines: int) -> str:
     return "\n".join(head + text[:lines] + ([f"... {len(text) - lines} more lines"] if len(text) > lines else []))
 
 
+# perf copies every file it records samples in (the binary snapshot, and the
+# hundreds of thousands of jitted-*.so files of a boot that perf inject
+# writes) into its build-id cache, ~/.debug by default, where they outlive
+# the capture: a few rounds of boot captures filled a disk. Each capture
+# keeps its cache inside itself instead, and is deleted with it.
+BUILDID_DIR = "buildid"
+
+
+def perf_command(capture: Path) -> List[str]:
+    """`perf` with the capture's own build-id cache, when it has one (older
+    captures used ~/.debug). The global --buildid-dir option, not the
+    PERF_BUILDID_DIR variable, which perf 6.8 ignores."""
+    cache = Path(capture) / BUILDID_DIR
+    return ["perf", "--buildid-dir", str(cache.resolve())] if cache.is_dir() else ["perf"]
+
+
 def preflight(event: str, rate: List[str], call_graph: str = "fp") -> Optional[str]:
     try:
         paranoid = int(Path("/proc/sys/kernel/perf_event_paranoid").read_text())
     except (OSError, ValueError):
         paranoid = None
-    probe = subprocess.run(["perf", "record", "-q", "-e", event, *rate, "--call-graph", call_graph,
-                            "-o", "/dev/null", "--", "true"],
+    probe = subprocess.run(["perf", "record", "-q", "--no-buildid-cache", "-e", event, *rate,
+                            "--call-graph", call_graph, "-o", "/dev/null", "--", "true"],
                            capture_output=True, text=True)
     if probe.returncode == 0:
         return None
@@ -157,12 +174,13 @@ def parse_record_stats(stats_lines: List[str], dump_lines: Iterable[str]) -> dic
 
 
 def record_stats(data: Path) -> dict:
-    stats = subprocess.run(["perf", "report", "--stats", "-i", str(data)], capture_output=True, text=True)
+    perf = perf_command(data.parent)
+    stats = subprocess.run([*perf, "report", "--stats", "-i", str(data)], capture_output=True, text=True)
     if stats.returncode != 0:
         return {"samples": None, "lost": None, "throttle": None,
                 "warning": f"perf report --stats failed: {stats.stderr.strip()[-200:]}"}
     # Streamed: a raw dump of a long capture is large.
-    dump = subprocess.Popen(["perf", "report", "-D", "-i", str(data)], stdout=subprocess.PIPE,
+    dump = subprocess.Popen([*perf, "report", "-D", "-i", str(data)], stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True, errors="replace")
     try:
         out = parse_record_stats(stats.stdout.splitlines(), dump.stdout)
@@ -182,14 +200,15 @@ def record(spec: RunSpec, directory: Path, window: Tuple[str, str], event: str,
     fifo = directory / "perf.ctl"
     os.mkfifo(fifo)
     # No ack FIFO: an ack pipe nobody reads deadlocks perf.
-    prefix = ["perf", "record", "-q", "-k", "mono", "--call-graph", call_graph, "--delay=-1", f"--control=fifo:{fifo}",
+    (directory / BUILDID_DIR).mkdir()
+    prefix = [*perf_command(directory), "record", "-q", "-k", "mono", "--call-graph", call_graph, "--delay=-1", f"--control=fifo:{fifo}",
               "-e", event, *rate, "-o", str(directory / "perf.data"), "--"]
     perf_spec = replace(spec, prefix=prefix, env={**spec.env, "JITDUMPDIR": str(directory / "run")},
                         args=spec.args + ["--perf-ctl-fifo", str(fifo), "--perf-window",
                                           f"{window[0]}:{window[1]}", "--perf-jitdump"])
     result = run(perf_spec, directory / "run")
     if result.reached:
-        inject = subprocess.run(["perf", "inject", "--jit", "-i", str(directory / "perf.data"),
+        inject = subprocess.run([*perf_command(directory), "inject", "--jit", "-i", str(directory / "perf.data"),
                                  "-o", str(directory / "perf.jit.data")], capture_output=True, text=True)
         if inject.returncode != 0:
             result.error = f"perf inject failed: {inject.stderr.strip()[-300:]}"
