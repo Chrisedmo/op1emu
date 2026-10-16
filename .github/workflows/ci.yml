@@ -63,7 +63,7 @@ jobs:
           CCACHE_BASEDIR: ${{ github.workspace }}
           CCACHE_MAXSIZE: 500M
         run: |
-          cmake --build build --target op1emu ldrdump op1-headless-test op1-time-source-test \
+          cmake --build build --target op1emu ldrdump op1-headless-test op1-time-source-test op1-data-fault-test \
             ${{ matrix.profiling == 'ON' && 'op1-mark-set-test op1-service-stats-test' || '' }}
           ccache --show-stats
 
