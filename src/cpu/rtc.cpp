@@ -94,7 +94,7 @@ u32 RTC::GetCurrentStat() {
 void RTC::UpdateInterrupts() {
     u32 ictl = Read32(0x04);
     u32 istat = Read32(0x08);
-    if (ictl & istat != 0) {
+    if ((ictl & istat) != 0) {
         TriggerInterrupt(1);
     } else {
         TriggerInterrupt(0);
