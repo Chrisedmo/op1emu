@@ -145,7 +145,7 @@ static std::tuple<u16, u16> ComputeEccPair(const u8* data, u32 length, u32 byteP
             if (pos & 0x1) p1 ^= bit;
             else           p1p ^= bit;
             if (pos & 0x2) p2 ^= bit;
-            else           p2 ^= bit;
+            else           p2p ^= bit;
             if (pos & 0x4) p4 ^= bit;
             else           p4p ^= bit;
             byteParity ^= bit;
