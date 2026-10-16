@@ -1,6 +1,7 @@
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 #include "audio_output_miniaudio.h"
+#include "audio_ring.h"
 #include "utils/log.h"
 #include <cstring>
 #include <algorithm>
@@ -158,15 +159,9 @@ void MiniaudioOutput::WriteSamples(const void* data, size_t samples, int channel
             chunk[i * CHANNELS + 1] = right;
         }
 
-        // Push to ring buffer
-        ma_uint32 framesToWrite = static_cast<ma_uint32>(framesToProcess);
-        void* writeBuffer;
-        ma_result result = ma_pcm_rb_acquire_write(rb, &framesToWrite, &writeBuffer);
-        if (result == MA_SUCCESS && framesToWrite > 0) {
-            memcpy(writeBuffer, chunk, framesToWrite * CHANNELS * sizeof(float));
-            ma_pcm_rb_commit_write(rb, framesToWrite);
-        }
-        // If ring buffer is full, we drop samples (acceptable for emulator)
+        // A write may stop at the physical end even when the ring has free
+        // space at the start. Continue there; drop only when the ring is full.
+        WriteAudioFrames(*rb, chunk, static_cast<ma_uint32>(framesToProcess), CHANNELS);
 
         framesRemaining -= framesToProcess;
         src += framesToProcess * srcStride;
