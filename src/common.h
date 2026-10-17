@@ -2,7 +2,11 @@
 
 #include <cstdint>
 #include <cstddef>
+#if defined(__APPLE__)
+#include <machine/endian.h>  // macOS: BYTE_ORDER / BIG_ENDIAN
+#else
 #include <endian.h>
+#endif
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;

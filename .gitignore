@@ -39,3 +39,10 @@
 
 # debug information files
 *.dwo
+
+# Local emulator state and build output
+build/
+nand.img
+otp.bin
+*.log
+.DS_Store
