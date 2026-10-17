@@ -39,6 +39,8 @@ public:
     virtual void HandleSetupPacket(USBSetupBytes setup, const u8* data, std::size_t length, ReplyCallback callback) = 0;
     virtual void HandleDataWrite(int ep, int interval, const u8* data, std::size_t length, WriteDoneCallback callback) = 0;
     virtual void HandleDataRead(int ep, int interval, std::size_t limit, ReplyCallback callback) = 0;
+    // True once the device firmware has enabled its USB port (SOFT_CONN).
+    virtual bool IsConnected() const { return true; }
 };
 
 
@@ -102,6 +104,8 @@ public:
     void HandleDataRead(int ep, int interval, std::size_t limit, ReplyCallback callback) override;
 
     void ProcessWithInterrupt(int ivg) override;
+
+    bool IsConnected() const override { return connected; }
 
 protected:
     void UpdateInterrupts();

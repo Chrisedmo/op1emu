@@ -24,7 +24,7 @@ USB::USB(u32 baseAddr): RegisterDevice("USB", baseAddr, 0x500) {
     REG32(USB_POWER, 0x04);
     FIELD(USB_POWER, HS_MODE, 4, 1, R(highSpeedMode), N());
     FIELD(USB_POWER, HS_ENABLE, 5, 1, R(highSpeedEnabled), W(highSpeedEnabled));
-    FIELD(USB_POWER, SOFT_CONN, 6, 1, R(connected), W(connected));
+    FIELD(USB_POWER, SOFT_CONN, 6, 1, R(connected), [this](u32 v) { if (bool(v) != connected) LogInfo("USB: soft connect %d", (int)v); connected = v; });
     FIELD(USB_POWER, ISO_UPDATE_EN, 7, 1, R(isocUpdateEnabled), W(isocUpdateEnabled));
 
     REG32(USB_INTRTX, 0x08);
