@@ -3,6 +3,8 @@
 #include <utils/log.h>
 #include <cassert>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 #define USBIP_SERVER_PORT 3240
 
@@ -16,7 +18,13 @@ void USBIPServer::Start()
     server->on<uvw::listen_event>([this] (const uvw::listen_event&, uvw::tcp_handle& srv) {
         auto client = srv.parent().resource<uvw::tcp_handle>();
 
-        client->on<uvw::close_event>([ptr = srv.shared_from_this()] (const uvw::close_event&, uvw::tcp_handle&) { ptr->close(); });
+        // Keep listening after a client disconnects (like re-plugging the cable);
+        // reset the protocol state so the next client starts cleanly.
+        client->on<uvw::close_event>([this] (const uvw::close_event&, uvw::tcp_handle&) {
+            LogInfo("USBIP: client disconnected");
+            buffer.pop(buffer.size());
+            state = USBIPState::WaitCommand;
+        });
         client->on<uvw::end_event>([] (const uvw::end_event&, uvw::tcp_handle& client) { client.close(); });
         client->on<uvw::data_event>([this] (const uvw::data_event& event, uvw::tcp_handle& client) { OnClientDataEvent(event, client); });
 
@@ -29,6 +37,14 @@ void USBIPServer::Start()
 
 void USBIPServer::ReplyImport(OP_REQ_IMPORT& req, uvw::tcp_handle& client)
 {
+    // Requests sent before the firmware enables USB are lost, so hold the
+    // import reply until the device has soft-connected (e.g. TE-BOOT upload mode).
+    if (!device.IsConnected()) {
+        LogInfo("USBIP: client waiting for the device to connect");
+        while (!device.IsConnected()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
     std::lock_guard lock(mutex);
     OP_REP_IMPORT rep{};
     rep.version = req.version;

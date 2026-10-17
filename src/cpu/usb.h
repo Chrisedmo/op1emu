@@ -41,6 +41,8 @@ public:
     virtual void HandleSetupPacket(USBSetupBytes setup, const u8* data, std::size_t length, ReplyCallback callback) = 0;
     virtual void HandleDataWrite(int ep, int interval, const u8* data, std::size_t length, WriteDoneCallback callback) = 0;
     virtual void HandleDataRead(int ep, int interval, std::size_t limit, ReplyCallback callback) = 0;
+    // True once the device firmware has enabled its USB port (SOFT_CONN).
+    virtual bool IsConnected() const { return true; }
 };
 
 
@@ -104,6 +106,8 @@ public:
     void HandleDataRead(int ep, int interval, std::size_t limit, ReplyCallback callback) override;
 
     void ProcessWithInterrupt(int ivg) override;
+
+    bool IsConnected() const override { return connected; }
     // ProcessWithInterrupt() has work: the USB is enabled (GLOBAL_ENA), and
     // the guest accessed it or the host sent a request since the last call.
     // Called on the thread that hands the USB a host request (the USB/IP
